@@ -519,6 +519,7 @@ def test_sfa_backend_selects_dcp_subclass_and_layout_specific_builder(pcp_size, 
         patch("vllm_ascend.attention.sfa_v1.enable_sfa_dcp_replicated_indexer", return_value=dcp_enabled),
     ):
         ascend_config.return_value.sparse_kv_offload_config.enabled = False
+        ascend_config.return_value.avsg_config.enabled = False
         assert AscendSFABackend.get_impl_cls() is (AscendSFADCPImpl if dcp_enabled else AscendSFAImpl)
         expected = AscendSFAMetadataBuilder
         if dcp_enabled:

@@ -414,6 +414,10 @@ class AscendSFABackend(AttentionBackend):
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
             return AscendSFAKVOffloadImpl
+        if get_ascend_config().avsg_config.enabled:
+            from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
+
+            return AscendAvsgSFAImpl
         if enable_sfa_dcp_replicated_indexer(get_current_vllm_config()):
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPImpl
 
@@ -480,6 +484,8 @@ class AscendSFAMetadata:
     smla_topk_length: torch.Tensor | None = None
     smla_valid_mask: torch.Tensor | None = None
     smla_sinks: torch.Tensor | None = None
+    # Dummy model-runner batches must never publish to the remote KV cache.
+    offload_dummy: bool = False
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -718,6 +724,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             block_size=block_size,
+            offload_dummy=common_attn_metadata.offload_dummy,
         )
         (
             metadata.num_decodes,

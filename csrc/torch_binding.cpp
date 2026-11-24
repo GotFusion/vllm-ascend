@@ -50,6 +50,9 @@
 #include "attention/fused_scatter_copy_sparse_flash_attention/fused_scatter_copy_sparse_flash_attention_torch_adpt.h"
 #include "attention/fused_quant_lightning_indexer_manage/fused_quant_lightning_indexer_manage_torch_adpt.h"
 #include "attention/indexer_region_score/indexer_region_score_torch_adpt.h"
+#ifdef VLLM_ASCEND_ENABLE_AVSG_MATCH
+#include "attention/avsg_match/avsg_match_torch_adpt.h"
+#endif
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/attn_res_fwd/attn_res_fwd_torch_adpt.h"
 #include "attention/kda_gate_cumsum_vllm/kda_gate_cumsum_vllm_torch_adpt.h"
@@ -2868,6 +2871,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+#ifdef VLLM_ASCEND_ENABLE_AVSG_MATCH
+    ops.def("npu_avsg_match(Tensor(a!) selection_kv_block_table, Tensor(b!) selection_kv_block_status, "
+            "Tensor(c!) selection_topk_indices, Tensor full_kv_block_table, Tensor full_kv_actual_seq, "
+            "Tensor full_q_actual_seq, int selection_topk_block_size, int kv_block_size) -> (Tensor, Tensor, Tensor)");
+    ops.impl("npu_avsg_match", c10::DispatchKey::PrivateUse1, &vllm_ascend::avsg_match);
+    ops.impl("npu_avsg_match", c10::DispatchKey::Meta, &vllm_ascend::avsg_match_outputs);
+#endif
     ops.def("hisparse_resolve_residency(Tensor logical, Tensor hot_table, Tensor? requests, Tensor? states, Tensor? source, "
             "Tensor? resident, Tensor? valid_rows, Tensor(a!) dgi, Tensor(a!) lru, Tensor(a!) output, "
             "Tensor(a!) resolved, Tensor(a!) errors, Tensor(a!)? attention, Tensor(a!)? counts, "

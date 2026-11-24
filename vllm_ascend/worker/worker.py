@@ -110,7 +110,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import get_global_rank, init_ascend_model_parallel
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -173,6 +173,8 @@ def allow_v2_model_runner_without_triton() -> Iterator[None]:
 
 
 class NPUWorker(GPUWorker):
+    _avsg_endpoint_file: str | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -215,6 +217,7 @@ class NPUWorker(GPUWorker):
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         ascend_config = init_ascend_config(vllm_config)
+        self._avsg_endpoint_file = ascend_config.avsg_config.endpoint_file
         from vllm_ascend.logger import configure_ascend_file_logging
 
         configure_ascend_file_logging(ascend_config.ascend_log_path)
@@ -498,6 +501,8 @@ class NPUWorker(GPUWorker):
         super()._start_weight_update()
 
     def shutdown(self) -> None:
+        if (transport := getattr(self, "avsg_transport", None)) is not None:
+            transport.close()
         model = getattr(getattr(self, "model_runner", None), "model", None)
         close_engram = getattr(model, "close_shared_engram", None)
         engram_error = None
@@ -1037,6 +1042,8 @@ class NPUWorker(GPUWorker):
 
         with context, empty_cache_context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+            if self._avsg_endpoint_file is not None:
+                self._init_avsg_transport(self._avsg_endpoint_file)
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -1052,6 +1059,36 @@ class NPUWorker(GPUWorker):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+    def _init_avsg_transport(self, endpoint_file: str) -> None:
+        # Load the optional backend only in workers that requested remote HBM.
+        from vllm_ascend.attention.avsg_transport import AvsgTransport
+        from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
+
+        layers = [
+            layer.impl
+            for layer in self.vllm_config.compilation_config.static_forward_context.values()
+            if isinstance(getattr(layer, "impl", None), AscendAvsgSFAImpl)
+        ]
+        if not layers or not enable_custom_op() or not hasattr(torch.ops._C_ascend, "npu_avsg_match"):
+            raise RuntimeError("AVSG requires the GLM SFA backend and a plugin built with the Ascend 950 AvsgMatch op")
+        allocated = torch.npu.memory_allocated(self.device)
+        model = self.vllm_config.model_config.hf_text_config
+        self.avsg_transport = AvsgTransport(
+            endpoint_file=endpoint_file,
+            rank=get_global_rank(self.parallel_config),
+            device=self.device,
+            layer_ids=[layer.avsg_layer_id for layer in layers],
+            block_size=128,  # AscendSFA's kernel page size, independent of scheduler group padding.
+            kv_dim=model.kv_lora_rank,
+            rope_dim=model.qk_rope_head_dim,
+            max_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=self.vllm_config.model_config.dtype,
+        )
+        for layer in layers:
+            layer.avsg_transport = self.avsg_transport
+        # The selection, staging and registered contexts live as long as the model.
+        self.model_runner.model_memory_usage += torch.npu.memory_allocated(self.device) - allocated
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.

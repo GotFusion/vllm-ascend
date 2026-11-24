@@ -12,8 +12,11 @@ repos:
   rev: v0.14.0
   hooks:
   - id: ruff-check
+    # Keep the separately built recipes extension byte-for-byte syncable.
+    exclude: ^csrc/avsg_urma/
     args: [--output-format, github, --fix]
   - id: ruff-format
+    exclude: ^csrc/avsg_urma/
 
 - repo: https://github.com/codespell-project/codespell
   rev: v2.4.1
@@ -49,7 +52,7 @@ repos:
   hooks:
   - id: markdownlint
     args: ['--fix']
-    exclude: '.*\.inc\.md$|.*report_template\.md$|.*contributors\.md$|.*PULL_REQUEST_TEMPLATE\.md$'
+    exclude: '^csrc/avsg_urma/|.*\.inc\.md$|.*report_template\.md$|.*contributors\.md$|.*PULL_REQUEST_TEMPLATE\.md$'
     stages: [manual] # Only run in CI
 
 - repo: https://github.com/rhysd/actionlint

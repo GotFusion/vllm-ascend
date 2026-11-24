@@ -1,0 +1,2 @@
+# A single space represents a blank context line in a vendored unified diff.
+csrc/avsg_urma/patches/*.patch whitespace=-blank-at-eol
