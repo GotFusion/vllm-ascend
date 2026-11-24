@@ -48,10 +48,12 @@ class AvsgTransport:
         self._max_tokens = max_tokens
         selection_blocks = AVSG_SELECTION_TOKENS // block_size
         source_blocks = (max_tokens + block_size - 1) // block_size
-        self._selection_kv = torch.empty((selection_blocks, block_size, kv_dim), device=device, dtype=dtype)
-        self._selection_rope = torch.empty((selection_blocks, block_size, rope_dim), device=device, dtype=dtype)
-        self._source_kv = torch.empty((source_blocks, block_size, kv_dim), device=device, dtype=dtype)
-        self._source_rope = torch.empty((source_blocks, block_size, rope_dim), device=device, dtype=dtype)
+        # HIXL pairs the two registered regions with the peer's KV and RoPE banks.
+        # Disjoint views keep read results and unpublished step rows independent.
+        buffer_blocks = selection_blocks + source_blocks
+        kv_buffer = torch.empty((buffer_blocks, block_size, kv_dim), device=device, dtype=dtype)
+        rope_buffer = torch.empty((buffer_blocks, block_size, rope_dim), device=device, dtype=dtype)
+        self._step_rows = torch.arange(max_tokens, device=device, dtype=torch.int32)
         self.selection_block_table = torch.arange(selection_blocks, device=device, dtype=torch.int32).unsqueeze(0)
         self._one_query = torch.ones(1, device=device, dtype=torch.int32)
         channels = endpoint.get("channels", 1)
@@ -73,8 +75,9 @@ class AvsgTransport:
         try:
             # Register each local allocation once. Each context then pairs that
             # allocation with a different layer's remote base addresses.
-            self._session.bind_selection(0, self._selection_kv, self._selection_rope)
-            self._session.bind_source("step", self._source_kv, self._source_rope)
+            _, _, self._source_kv, self._source_rope = self._session.bind_staging(
+                0, "step", kv_buffer, rope_buffer, selection_blocks
+            )
             self._session.connect(endpoint["peer_engine"], timeout_ms=endpoint.get("timeout_ms", 30000))
             for layer, layout in remote.items():
                 self._session.prepare_layer(0, layout)
@@ -93,28 +96,39 @@ class AvsgTransport:
             self._session.close()
             self._closed = True
 
-    def publish(self, layer_id: int, kv: torch.Tensor, rope: torch.Tensor, slots: torch.Tensor) -> None:
-        """Write materialized scheduler slots to the identical physical slots on the peer."""
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    @property
+    def remote_block_capacity(self) -> int:
+        """Number of physical kernel pages available to every main-KV layer on this worker."""
+        return min(self._remote_blocks.values())
+
+    @property
+    def staging_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Paged views of the WRITE buffers shared across layers for this scheduler step."""
+        return self._source_kv.unsqueeze(2), self._source_rope.unsqueeze(2)
+
+    def staging_slots(self, slots: torch.Tensor) -> torch.Tensor:
+        """Map remote slot IDs to step-local row numbers, retaining padding holes."""
+        if slots.numel() > self._max_tokens:
+            raise ValueError("AVSG batch exceeds registered WRITE capacity")
+        rows = self._step_rows[: slots.numel()].view_as(slots).to(slots.dtype)
+        return torch.where(slots >= 0, rows, -1)
+
+    def publish_staged(self, layer_id: int, slots: torch.Tensor) -> None:
+        """Write fresh rows from the registered step cache into their physical slots on the peer."""
         if self._closed:
             raise RuntimeError("AVSG transport is closed")
-        if kv.shape[:3] != (kv.shape[0], self._block_size, 1) or rope.shape[:3] != kv.shape[:3]:
-            raise ValueError("AVSG requires separate paged KV and RoPE tensors with one cache head")
-        if kv.shape[0] > self._remote_blocks[layer_id]:
-            raise ValueError(f"AVSG peer layer {layer_id} needs at least {kv.shape[0]} physical blocks")
         slots = slots.reshape(-1)
         if slots.numel() > self._max_tokens:
             raise ValueError("AVSG batch exceeds registered WRITE capacity")
-        valid = slots[slots >= 0].long()
-        if not valid.numel():
+        local = (slots >= 0).nonzero().flatten()
+        count = local.numel()
+        if not count:
             return
-        blocks = valid // self._block_size
-        offsets = valid % self._block_size
-        count = valid.numel()
-        # Paged KV views can have padding between blocks. Preserve their strides.
-        self._source_kv.flatten(0, 1)[:count].copy_(kv[blocks, offsets, 0])
-        self._source_rope.flatten(0, 1)[:count].copy_(rope[blocks, offsets, 0])
-        local = torch.arange(count, device=slots.device, dtype=torch.int32)
-        mapping = torch.stack((valid.int(), local), dim=-1).view(1, 1, count, 2)
+        mapping = torch.stack((slots[local].int(), local.int()), dim=-1).view(1, 1, count, 2)
         counts = torch.full((1, 1), count, device=slots.device, dtype=torch.int32)
         src_rope, src_kv, context, scratch, seen, status, remote_slots = self._writes[layer_id]
         try:
@@ -125,6 +139,24 @@ class AvsgTransport:
         except Exception:
             self.close()
             raise
+
+    def publish(self, layer_id: int, kv: torch.Tensor, rope: torch.Tensor, slots: torch.Tensor) -> None:
+        """Publish from a caller-owned paged reference cache, e.g. for two-endpoint parity checks."""
+        if self._closed:
+            raise RuntimeError("AVSG transport is closed")
+        if kv.shape[:3] != (kv.shape[0], self._block_size, 1) or rope.shape[:3] != kv.shape[:3]:
+            raise ValueError("AVSG requires separate paged KV and RoPE tensors with one cache head")
+        if kv.shape[0] > self._remote_blocks[layer_id]:
+            raise ValueError(f"AVSG peer layer {layer_id} needs at least {kv.shape[0]} physical blocks")
+        slots = slots.reshape(-1)
+        if slots.numel() > self._max_tokens:
+            raise ValueError("AVSG batch exceeds registered WRITE capacity")
+        local = (slots >= 0).nonzero().flatten()
+        valid = slots[local].long()
+        blocks, offsets = valid // self._block_size, valid % self._block_size
+        for staging, cache in zip(self.staging_cache, (kv, rope)):
+            staging.flatten(0, 1).index_copy_(0, local, cache[blocks, offsets])
+        self.publish_staged(layer_id, slots)
 
     def gather(
         self, layer_id: int, q_lens: torch.Tensor, mapping: torch.Tensor, counts: torch.Tensor

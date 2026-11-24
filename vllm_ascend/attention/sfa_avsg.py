@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager GLM sparse attention using a remote HBM mirror and AVSG selection."""
+"""Eager GLM sparse attention over paged KV held in peer HBM."""
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 import torch
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.math_utils import cdiv
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata
+from vllm_ascend.device.device_op import DeviceOperator
 
 if TYPE_CHECKING:
     from vllm_ascend.attention.avsg_transport import AvsgTransport
 
 
 class AscendAvsgSFAImpl(AscendSFAImpl):
+    store_kv_cache_on_peer = True
     # The worker owns one connection and one registered selection buffer per rank.
     avsg_transport: AvsgTransport
 
@@ -25,11 +27,19 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         super().__init__(*args, **kwargs)
         self.avsg_layer_id = extract_layer_index(self.layer_name)
 
+    def _compose_sfa_kv_cache(self, kv_cache):
+        # All main-KV preprocessing paths write the registered staging pair.
+        # The base class appends the layer's separately allocated indexer cache.
+        return super()._compose_sfa_kv_cache(self.avsg_transport.staging_cache)
+
+    def _get_sfa_kv_slot_mapping(self, attn_metadata: AscendSFAMetadata) -> torch.Tensor:
+        return self.avsg_transport.staging_slots(attn_metadata.slot_mapping)
+
     def _on_kv_cache_written(self, kv_cache, attn_metadata: AscendSFAMetadata) -> None:
         if attn_metadata.offload_dummy or not attn_metadata.num_actual_tokens:
             return
         slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
-        self.avsg_transport.publish(self.avsg_layer_id, kv_cache[0], kv_cache[1], slots)
+        self.avsg_transport.publish_staged(self.avsg_layer_id, slots)
 
     def _execute_sparse_flash_attention_process(
         self,
@@ -42,20 +52,11 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         actual_seq_lengths_key,
         block_table=None,
     ):
-        if attn_metadata.offload_dummy or attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            return super()._execute_sparse_flash_attention_process(
-                ql_nope,
-                q_pe,
-                kv_cache,
-                topk_indices,
-                attn_metadata,
-                actual_seq_lengths_query,
-                actual_seq_lengths_key,
-                block_table,
-            )
+        output = torch.zeros_like(ql_nope)
+        if attn_metadata.offload_dummy or not attn_metadata.num_actual_tokens:
+            return output
 
-        # Each real request schedules one token in eager, non-speculative decode.
-        # Submit requests serially so all layers can share one registered selection
+        # Submit queries serially so all requests and layers can share one registered selection
         # buffer. The adapter's checked copy and attention run on the current stream.
         full_table = attn_metadata.block_table if block_table is None else block_table
         selection_table = self.avsg_transport.selection_block_table
@@ -63,42 +64,59 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         selection_slots = selection_table.shape[1] * block_size
         status = selection_table.new_empty((1, 2 * selection_slots))
         query_len = selection_table.new_ones(1)
-        output = torch.zeros_like(ql_nope)
-        # Unquantized GLM SFA already has a host mirror of the sequence lengths.
-        # Trimming to live blocks avoids copying a max-model-length table to Match's UB.
-        assert attn_metadata.seq_lens_cpu is not None
-        seq_lens = attn_metadata.seq_lens_cpu[: attn_metadata.num_actual_tokens].tolist()
-        for row, seq_len in enumerate(seq_lens):
-            kv_len = actual_seq_lengths_key[row : row + 1].to(torch.int32)
-            row_table = full_table[row : row + 1, : cdiv(seq_len, block_size)].contiguous()
-            indices = topk_indices[row : row + 1].reshape(1, 1, -1)
-            # Match rewrites logical indices to selection slots. Shared-indexer
-            # layers still need the original logical top-k, including its padding.
-            remapped = torch.where((indices >= 0) & (indices < kv_len), indices, -1).to(torch.int32).contiguous()
-            # The scratch row changes owner between requests and between layers.
-            status.fill_(-1)
-            _, mapping, counts = torch.ops._C_ascend.npu_avsg_match(
-                selection_table,
-                status,
-                remapped,
-                row_table,
-                kv_len,
-                query_len,
-                1,
-                block_size,
-            )
-            selected = self.avsg_transport.gather(self.avsg_layer_id, query_len, mapping, counts)
-            # For a single decode token, every selected slot is causally visible.
-            # SFA's effective KV length must fit its supplied selection page table.
-            selected_len = kv_len.clamp_max(selection_slots)
-            output[row : row + 1] = super()._execute_sparse_flash_attention_process(
-                ql_nope[row : row + 1],
-                q_pe[row : row + 1],
-                selected,
-                remapped,
-                attn_metadata,
-                query_len,
-                selected_len,
-                selection_table,
-            )
+        # Both host tensors are already populated by the model runner. The device
+        # KV lengths remain authoritative for masking and for AVSG Match.
+        assert attn_metadata.query_start_loc_cpu is not None and attn_metadata.seq_lens_cpu is not None
+        query_starts = attn_metadata.query_start_loc_cpu.tolist()
+        for request, (start, stop) in enumerate(pairwise(query_starts)):
+            stop = min(stop, attn_metadata.num_actual_tokens)
+            if start >= stop:
+                continue
+            # Trim the full page table to live blocks before copying it to Match's UB.
+            blocks = cdiv(int(attn_metadata.seq_lens_cpu[request]), block_size)
+            row_table = full_table[request : request + 1, :blocks].contiguous()
+            seq_len = actual_seq_lengths_key[request : request + 1].to(torch.int32)
+            for row in range(start, stop):
+                # All KV for this scheduled chunk has been published. Each query
+                # can see its cached prefix and only its own prefix of this chunk.
+                visible_len = seq_len - (stop - row - 1)
+                indices = topk_indices[row : row + 1].reshape(1, 1, -1)
+                # A5 SFA finds the valid prefix before the first -1. Pack it in
+                # order on a private tensor because Match rewrites the entries
+                # and the next shared-indexer layer needs the original indices.
+                # Eager execution can synchronize to size this dynamic selection.
+                valid = indices.masked_select((indices >= 0) & (indices < visible_len))
+                if not valid.numel():
+                    continue
+                remapped = torch.full(indices.shape, -1, device=indices.device, dtype=torch.int32)
+                remapped.view(-1)[: valid.numel()].copy_(valid)
+                status.fill_(-1)
+                _, mapping, counts = torch.ops._C_ascend.npu_avsg_match(
+                    selection_table,
+                    status,
+                    remapped,
+                    row_table,
+                    visible_len,
+                    query_len,
+                    1,
+                    block_size,
+                )
+                selected = self.avsg_transport.gather(self.avsg_layer_id, query_len, mapping, counts)
+                # Causality was enforced in logical-token space above. After
+                # remapping, mode 0 with LSE makes A5 bound softmax by the actual
+                # valid prefix even when the KV length is greater than the top-k.
+                row_output, _, _ = DeviceOperator.execute_sparse_flash_attention_process(
+                    self,
+                    ql_nope[row : row + 1],
+                    q_pe[row : row + 1],
+                    selected,
+                    remapped,
+                    attn_metadata,
+                    query_len,
+                    visible_len.clamp_max(selection_slots),
+                    block_table=selection_table,
+                    sparse_mode=0,
+                    return_lse=True,
+                )
+                output[row : row + 1] = row_output
         return output

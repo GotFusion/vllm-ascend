@@ -63,3 +63,8 @@ def test_avsg_requires_matching_hardware_and_distinct_endpoints():
         cfg.validate(_glm_config(), False)
     with patch("vllm_ascend.ascend_config.is_950", return_value=True), pytest.raises(ValueError, match="rank"):
         cfg.validate(_glm_config(), False)
+
+
+def test_avsg_rejects_kv_layer_parallelism():
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True), pytest.raises(ValueError, match="KVPP"):
+        AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(_glm_config(), False, kvpp_size=2)

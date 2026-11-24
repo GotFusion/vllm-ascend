@@ -30,11 +30,10 @@ def main():
     with AvsgUrmaCacheServer(local_engine=config["local_engine"], device=device,
                             local_comm_res=json.dumps(config["local_comm_res"]),
                             channels=config.get("channels", 1)) as server:
-        for layer in range(layout["layers"]):
-            shape = (layout["blocks"], layout["block_size"])
-            kv = torch.zeros((*shape, layout["kv_dim"]), dtype=dtype, device=f"npu:{device}")
-            rope = torch.zeros((*shape, layout["rope_dim"]), dtype=dtype, device=f"npu:{device}")
-            server.register_layer(layer, kv, rope)
+        shape = (layout["layers"], layout["blocks"], layout["block_size"])
+        kv = torch.zeros((*shape, layout["kv_dim"]), dtype=dtype, device=f"npu:{device}")
+        rope = torch.zeros((*shape, layout["rope_dim"]), dtype=dtype, device=f"npu:{device}")
+        server.register_layers(0, kv, rope)
         payload = json.dumps(server.publish_layout(), indent=2)
         with manifest.open("x", encoding="utf-8") as output:
             output.write(payload)

@@ -486,6 +486,7 @@ class AscendSFAMetadata:
     smla_sinks: torch.Tensor | None = None
     # Dummy model-runner batches must never publish to the remote KV cache.
     offload_dummy: bool = False
+    query_start_loc_cpu: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -725,6 +726,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             block_size=block_size,
             offload_dummy=common_attn_metadata.offload_dummy,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu[: num_reqs + 1],
         )
         (
             metadata.num_decodes,

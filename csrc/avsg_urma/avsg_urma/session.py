@@ -95,28 +95,51 @@ class AvsgUrmaCacheServer(_Endpoint):
             self._check_open()
             if self._sealed or layer_id in self._layouts:
                 raise ValueError("registration is sealed or layer is already registered")
-            dtype = _check_cache(full_kv, self.device, dim_limit=1024)
-            if full_rope is not None:
-                rope_dtype = _check_cache(full_rope, self.device, dim_limit=64)
-                if full_rope.shape[:2] != full_kv.shape[:2] or rope_dtype != dtype:
-                    raise ValueError("full KV and RoPE layouts/dtypes differ")
-            # Validate source strides and block size before making any registration.
-            width = full_kv.element_size()
-            def span(t):
-                return (sum((size - 1) * stride for size, stride in zip(t.shape, t.stride())) + 1) * width
-            layout = RemoteCache(
-                kv_base=full_kv.data_ptr(), kv_bytes=span(full_kv), blocks=full_kv.shape[0],
-                block_size=full_kv.shape[1], kv_dim=full_kv.shape[2],
-                kv_stride0=full_kv.stride(0) * width, kv_stride1=full_kv.stride(1) * width, dtype=dtype,
-                rope_base=full_rope.data_ptr() if full_rope is not None else 0,
-                rope_bytes=span(full_rope) if full_rope is not None else 0,
-                rope_dim=full_rope.shape[2] if full_rope is not None else 0,
-                rope_stride0=full_rope.stride(0) * width if full_rope is not None else 0,
-                rope_stride1=full_rope.stride(1) * width if full_rope is not None else 0,
-            )
+            layout = self._layer_layout(full_kv, full_rope)
             self._register_storage(full_kv, full_rope)
             self._layouts[layer_id] = layout
             return layout
+
+    def register_layers(self, first_layer_id, full_kv, full_rope=None):
+        """Register contiguous [layer, block, token, dim] caches once per tensor."""
+        with self._lock:
+            self._check_open()
+            if full_kv.ndim != 4 or not full_kv.is_contiguous() or full_kv.size(0) == 0:
+                raise ValueError("expected a nonempty contiguous rank-4 KV cache")
+            if full_rope is not None and (full_rope.ndim != 4 or not full_rope.is_contiguous() or
+                                          full_rope.shape[:3] != full_kv.shape[:3]):
+                raise ValueError("expected a contiguous rank-4 RoPE cache matching the KV layers and pages")
+            layer_ids = range(first_layer_id, first_layer_id + full_kv.size(0))
+            if self._sealed or any(layer in self._layouts for layer in layer_ids):
+                raise ValueError("registration is sealed or layer is already registered")
+            layouts = {
+                layer: self._layer_layout(full_kv[i], full_rope[i] if full_rope is not None else None)
+                for i, layer in enumerate(layer_ids)
+            }
+            self._register_storage(full_kv, full_rope)
+            self._layouts.update(layouts)
+
+    def _layer_layout(self, full_kv, full_rope):
+        dtype = _check_cache(full_kv, self.device, dim_limit=1024)
+        if full_rope is not None:
+            rope_dtype = _check_cache(full_rope, self.device, dim_limit=64)
+            if full_rope.shape[:2] != full_kv.shape[:2] or rope_dtype != dtype:
+                raise ValueError("full KV and RoPE layouts/dtypes differ")
+        width = full_kv.element_size()
+
+        def span(t):
+            return (sum((size - 1) * stride for size, stride in zip(t.shape, t.stride())) + 1) * width
+
+        return RemoteCache(
+            kv_base=full_kv.data_ptr(), kv_bytes=span(full_kv), blocks=full_kv.shape[0],
+            block_size=full_kv.shape[1], kv_dim=full_kv.shape[2],
+            kv_stride0=full_kv.stride(0) * width, kv_stride1=full_kv.stride(1) * width, dtype=dtype,
+            rope_base=full_rope.data_ptr() if full_rope is not None else 0,
+            rope_bytes=span(full_rope) if full_rope is not None else 0,
+            rope_dim=full_rope.shape[2] if full_rope is not None else 0,
+            rope_stride0=full_rope.stride(0) * width if full_rope is not None else 0,
+            rope_stride1=full_rope.stride(1) * width if full_rope is not None else 0,
+        )
 
     def publish_layout(self):
         """Seal registrations and return JSON-serializable metadata after producer completion.
@@ -188,6 +211,28 @@ class AvsgUrmaSession(_Endpoint):
                 rope = torch.empty(0, dtype=kv.dtype, device=self.device)
             self._layers[layer_id] = _Binding(kv, rope)
 
+    def bind_staging(self, layer_id, source, full_kv, full_rope, selection_blocks):
+        """Register KV/RoPE once and split each into disjoint READ and WRITE buffers."""
+        with self._lock:
+            self._check_open()
+            if self._connected or layer_id in self._layers or source in self._sources:
+                raise ValueError("bind each selection and WRITE source once before Connect")
+            dtype = _check_cache(full_kv, self.device, dim_limit=1024)
+            if not full_kv.is_contiguous() or not 0 < selection_blocks < full_kv.size(0):
+                raise ValueError("staging KV needs contiguous, nonempty selection and WRITE blocks")
+            selection_kv, source_kv = full_kv[:selection_blocks], full_kv[selection_blocks:]
+            if full_rope is None:
+                selection_rope = source_rope = torch.empty(0, dtype=full_kv.dtype, device=self.device)
+            else:
+                if (_check_cache(full_rope, self.device, dim_limit=64) != dtype or
+                        not full_rope.is_contiguous() or full_rope.shape[:2] != full_kv.shape[:2]):
+                    raise ValueError("staging RoPE must match KV and be contiguous")
+                selection_rope, source_rope = full_rope[:selection_blocks], full_rope[selection_blocks:]
+            self._register_storage(full_kv, full_rope)
+            self._layers[layer_id] = _Binding(selection_kv, selection_rope)
+            self._sources[source] = _Binding(source_kv, source_rope)
+            return selection_kv, selection_rope, source_kv, source_rope
+
     def bind_source(self, name, kv, rope):
         with self._lock:
             self._check_open()
@@ -235,7 +280,8 @@ class AvsgUrmaSession(_Endpoint):
             if (remote.dtype != dtype or binding.kv.shape[1:] != (remote.block_size, remote.kv_dim) or
                     binding.rope.numel() != binding.kv.shape[0] * remote.block_size * remote.rope_dim):
                 raise ValueError("remote layout differs from local selection")
-            # Require the exact RVA returned by the registered layer's metadata, never GetAddr(0).
+            # A layer can start inside a larger MR. HIXL validates its whole subrange
+            # and returns the supplied URMA RVA; a zero-address query would lose its offset.
             if self._owner.remote_address(remote.kv_base, remote.kv_bytes) != remote.kv_base:
                 raise RuntimeError("URMA GetAddr did not return the advertised RVA")
             if remote.rope_dim:

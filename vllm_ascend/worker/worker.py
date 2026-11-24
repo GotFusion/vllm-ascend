@@ -60,7 +60,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-from vllm.v1.core.kv_cache_planning import unify_hybrid_kv_cache_specs
+from vllm.v1.core.kv_cache_planning import _pool_bytes_per_block, unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -88,6 +88,7 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core import kv_cache_dtype_handlers  # noqa: F401
+from vllm_ascend.core.kv_cache_interface import get_avsg_cache_block_limit
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     create_kvpp_cache_allocation_plan,
@@ -850,6 +851,17 @@ class NPUWorker(GPUWorker):
         if not isinstance(kv_cache_spec, dict):
             return available_memory
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        if self._avsg_endpoint_file is not None:
+            transport = self.avsg_transport
+            block_limit = get_avsg_cache_block_limit(
+                kv_cache_groups, transport.remote_block_capacity, transport.block_size, available_memory
+            )
+            override = self.cache_config.num_gpu_blocks_override
+            if override is not None and override > block_limit:
+                raise ValueError(f"AVSG cannot allocate {override} blocks: local indexer and peer permit {block_limit}")
+            logger.info("AVSG local indexer and remote main KV allow up to %d scheduler blocks.", block_limit)
+            # Express the physical ID limit in Core's logical GLM pool byte units.
+            return block_limit * _pool_bytes_per_block(self.vllm_config, kv_cache_groups)
         if not kv_cache_groups:
             return available_memory
         # Ascend's DSV4/V4.1 and GLM-Next planners already account for shared
@@ -1307,6 +1319,15 @@ class NPUWorker(GPUWorker):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        if self._avsg_endpoint_file is not None:
+            # Also check the final cross-worker plan, including paths which
+            # restore an existing memory budget without profiling this worker.
+            transport = self.avsg_transport
+            peer_limit = get_avsg_cache_block_limit(
+                kv_cache_config.kv_cache_groups, transport.remote_block_capacity, transport.block_size
+            )
+            if kv_cache_config.num_blocks > peer_limit:
+                raise ValueError(f"AVSG plan requests {kv_cache_config.num_blocks} blocks, but peer holds {peer_limit}")
         speculator = getattr(self.model_runner, "speculator", None)
         speculative = self.vllm_config.speculative_config
         if (

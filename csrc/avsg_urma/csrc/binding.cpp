@@ -421,8 +421,8 @@ public:
         for (const auto &reg : registrations_) {
             TORCH_CHECK(reinterpret_cast<uint64_t>(reg.tensor.data_ptr()) == reg.base && Span(reg.tensor) == reg.bytes,
                         "Registered Tensor storage changed");
-            kv |= reg.base == ctx.localKv && reg.bytes == ctx.localKvBytes;
-            rope |= reg.base == ctx.localRope && reg.bytes == ctx.localRopeBytes;
+            kv |= Covers(reg.base, reg.bytes, ctx.localKv, ctx.localKvBytes);
+            rope |= Covers(reg.base, reg.bytes, ctx.localRope, ctx.localRopeBytes);
         }
         TORCH_CHECK(kv && rope, "Selection not owned by this endpoint");
     }

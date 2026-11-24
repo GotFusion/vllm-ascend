@@ -204,6 +204,7 @@ class AscendMLAAttention(MLAAttention):
             ),
             cache_sparse_sfa_turboquant=use_sfa_turboquant,
             cache_sparse_sfa_c8=use_sfa_c8,
+            store_on_peer=getattr(self.impl, "store_kv_cache_on_peer", False) is True,
             store_on_host=(
                 # Only draft layers owned by the DSpark resident protocol stay
                 # device-resident; an MTP head under another method has no

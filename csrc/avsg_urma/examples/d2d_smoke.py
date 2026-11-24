@@ -80,12 +80,17 @@ def client(args, options):
                              jetty_strategy=args.jetty_strategy, batch_descriptors=args.lanes,
                              measure_devbw=args.devbw, measure_hostbw=True) as endpoint:
             dtype = getattr(torch, args.dtype)
-            kv = selection_cache(args.selection_tokens, KV_DIM, dtype)
-            rope = selection_cache(args.selection_tokens, ROPE_DIM, dtype)
-            endpoint.bind_selection(0, kv, rope)
             if args.check_write:
-                endpoint.bind_source("write", full_cache(args.selection_tokens, KV_DIM, dtype),
-                                     full_cache(args.selection_tokens, ROPE_DIM, dtype))
+                kv = selection_cache(2 * args.selection_tokens, KV_DIM, dtype)
+                rope = selection_cache(2 * args.selection_tokens, ROPE_DIM, dtype)
+                _, _, source_kv, source_rope = endpoint.bind_staging(
+                    0, "write", kv, rope, args.selection_tokens // BLOCK_SIZE)
+                for source, dim in ((source_kv, KV_DIM), (source_rope, ROPE_DIM)):
+                    source.view(torch.uint8).copy_(full_cache(args.selection_tokens, dim, dtype).view(torch.uint8))
+            else:
+                kv = selection_cache(args.selection_tokens, KV_DIM, dtype)
+                rope = selection_cache(args.selection_tokens, ROPE_DIM, dtype)
+                endpoint.bind_selection(0, kv, rope)
             send(sock, {"state": "registered"})
             layout = RemoteCache(**receive(sock)["0"])
             endpoint.connect(args.peer_engine)

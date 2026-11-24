@@ -351,6 +351,14 @@ KV production/update and readiness. No model YAML is silently changed to pretend
 remote-cache placement already exists. Multiple layers may share a Session sequentially;
 register/bind every layer before Connect and prepare each layer's remote manifest separately.
 
+For vLLM's multi-layer READ/WRITE path, the two endpoints must register the same number of
+memory regions. The peer calls `register_layers(0, kv_bank, rope_bank)` with contiguous
+`[layers, blocks, block_size, dim]` tensors. The model calls
+`bind_staging(0, "step", kv_buffer, rope_buffer, selection_blocks)` once before connecting.
+Each model buffer has shape `[selection_blocks + write_blocks, block_size, dim]`. Reads and
+writes use disjoint views of the registered buffers. Each manifest entry identifies the
+address and byte span of its layer inside the peer banks.
+
 When RoPE is absent pass `None` to register/bind. Session creates the required empty device
 Tensor. Selection must be contiguous and remain at its registered address; source caches
 are rank-3 `[blocks, block_size, dim]` with positive byte strides. Normalize a model's singleton

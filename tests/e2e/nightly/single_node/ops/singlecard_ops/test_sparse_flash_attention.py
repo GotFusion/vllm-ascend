@@ -13,11 +13,11 @@ from vllm_ascend.utils import enable_custom_op
     get_ascend_device_type() != AscendDeviceType.A5,
     reason="Regression for the A5 SFA kernel",
 )
-@pytest.mark.parametrize("selected_count", [0, 1, 127, 128, 129, 257])
-def test_sparse_flash_attention_padded_indices_lse(selected_count):
+@pytest.mark.parametrize("kv_length, selected_count", [(512, n) for n in (0, 1, 127, 128, 129, 257)] + [(3072, 4)])
+def test_sparse_flash_attention_padded_indices_lse(kv_length, selected_count):
     enable_custom_op()
     torch.manual_seed(928)
-    heads, kv_length, capacity = 64, 512, 2048
+    heads, capacity = 64, 2048
     query = torch.randn(1, heads, 512, dtype=torch.bfloat16)
     query_rope = torch.randn(1, heads, 64, dtype=torch.bfloat16)
     key = torch.randn(kv_length, 512, dtype=torch.bfloat16)
@@ -25,8 +25,9 @@ def test_sparse_flash_attention_padded_indices_lse(selected_count):
     selected = torch.randperm(kv_length)[:selected_count].sort().values
     indices = torch.full((1, 1, capacity), -1, dtype=torch.int32)
     indices[0, 0, :selected_count] = selected.int()
-    pages = key.reshape(4, 128, 1, 512).npu()
-    rope_pages = key_rope.reshape(4, 128, 1, 64).npu()
+    num_pages = kv_length // 128
+    pages = key.reshape(num_pages, 128, 1, 512).npu()
+    rope_pages = key_rope.reshape(num_pages, 128, 1, 64).npu()
     output, maximum, total = torch.ops._C_ascend.npu_sparse_flash_attention(
         query=query.npu(),
         key=pages,
@@ -34,7 +35,7 @@ def test_sparse_flash_attention_padded_indices_lse(selected_count):
         sparse_indices=indices.npu(),
         scale_value=1 / 24,
         sparse_block_size=1,
-        block_table=torch.arange(4, dtype=torch.int32).reshape(1, -1).npu(),
+        block_table=torch.arange(num_pages, dtype=torch.int32).reshape(1, -1).npu(),
         actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32).npu(),
         actual_seq_lengths_kv=torch.tensor([kv_length], dtype=torch.int32).npu(),
         query_rope=query_rope.npu(),

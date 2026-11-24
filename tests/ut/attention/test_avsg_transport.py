@@ -17,12 +17,18 @@ from vllm_ascend.attention.avsg_transport import AvsgTransport
 class MemoryPeer:
     def __init__(self):
         self.session = Mock()
+        self.session.bind_staging.side_effect = self.bind_staging
         self.session.prepare_layer.side_effect = self.prepare_layer
         self.session.prepare_graph_write.side_effect = self.prepare_write
         self.session.prepare_graph_copy.side_effect = self.prepare_read
         self.session.check_graph_copy.side_effect = self.check
         self.rows = {}
         self.failure = None
+
+    def bind_staging(self, layer_id, source, kv, rope, selection_blocks):
+        self.selection = kv[:selection_blocks], rope[:selection_blocks]
+        self.source = kv[selection_blocks:], rope[selection_blocks:]
+        return *self.selection, *self.source
 
     def prepare_layer(self, layer_id, remote):
         self.base = remote.kv_base
@@ -33,11 +39,11 @@ class MemoryPeer:
         )
 
     def prepare_write(self, *, layer_id, source, mapping_capacity, workspace=None):
-        _, kv, rope = self.session.bind_source.call_args.args
+        kv, rope = self.source
         return rope, kv, self.base, None, None, torch.zeros(1), self.slots
 
     def prepare_read(self, *, layer_id, mapping_capacity, workspace=None):
-        _, kv, rope = self.session.bind_selection.call_args.args
+        kv, rope = self.selection
         return rope, kv, self.base, None, None, torch.zeros(1)
 
     def transfer(self, direction, rope, kv, q, mapping, count, base, scratch, seen, status, *args):
@@ -158,6 +164,41 @@ def test_padding_only_batch_preserves_remote_cache(transport):
     peer.session.check_graph_copy.assert_not_called()
     for remote_kv, remote_rope in peer.rows.values():
         assert remote_kv.count_nonzero() == remote_rope.count_nonzero() == 0
+
+
+def test_publish_step_without_local_history(transport):
+    adapter, peer = transport
+    assert adapter.remote_block_capacity == 2
+    kv, rope = adapter.staging_cache
+    assert kv.shape == (1, 128, 1, 2)
+    assert rope.shape == (1, 128, 1, 1)
+    remote_slots = torch.tensor([255, -1, 128, 3])
+    assert adapter.staging_slots(remote_slots).tolist() == [0, -1, 2, 3]
+    for layer in (0, 3):
+        kv.flatten(0, 1)[:4].copy_(torch.arange(8).reshape(4, 1, 2) + layer)
+        rope.flatten(0, 1)[:4].copy_(torch.arange(4).reshape(4, 1, 1) + layer)
+        adapter.publish_staged(layer, remote_slots)
+    for layer in (0, 3):
+        remote_kv, remote_rope = peer.rows[(layer + 1) * 8192]
+        assert remote_kv[[255, 128, 3]].tolist() == [[layer, layer + 1], [layer + 4, layer + 5], [layer + 6, layer + 7]]
+        assert remote_rope[[255, 128, 3], 0].tolist() == [layer, layer + 2, layer + 3]
+
+    # Reuse step row 0 for a new token. A request can still gather the old
+    # prefix in slot 255 after the layer and request occupying staging changed.
+    kv.flatten(0, 1)[0].fill_(40)
+    rope.flatten(0, 1)[0].fill_(50)
+    adapter.publish_staged(0, torch.tensor([4]))
+    selected_kv, selected_rope = adapter.gather(
+        0,
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([[[[255, 0], [4, 2]]]], dtype=torch.int32),
+        torch.tensor([[2]], dtype=torch.int32),
+    )
+    assert selected_kv.flatten(0, 1)[[0, 2], 0].tolist() == [[0, 1], [40, 40]]
+    assert selected_rope.flatten(0, 1)[[0, 2], 0, 0].tolist() == [0, 50]
+    assert kv.flatten(0, 1)[0, 0].tolist() == [40, 40]
+    with pytest.raises(ValueError, match="capacity"):
+        adapter.publish_staged(0, torch.ones(5, dtype=torch.int32))
 
 
 @pytest.mark.parametrize("direction", ["write", "read"])

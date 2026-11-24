@@ -127,7 +127,7 @@ class AvsgConfig:
     def enabled(self) -> bool:
         return self.endpoint_file is not None
 
-    def validate(self, vc: VllmConfig, host_offload: bool) -> None:
+    def validate(self, vc: VllmConfig, host_offload: bool, kvpp_size: int = 1) -> None:
         if self.endpoint_file is None:
             return
         model = vc.model_config
@@ -142,6 +142,8 @@ class AvsgConfig:
             raise ValueError("avsg_config requires BF16 main KV and RoPE caches")
         if host_offload or vc.attention_config.hisparse_config is not None or vc.kv_transfer_config is not None:
             raise ValueError("avsg_config needs locally produced KV and cannot share a cache with another KV backend")
+        if kvpp_size > 1:
+            raise ValueError("avsg_config requires per-worker ownership of all local layers and cannot use KVPP")
         if max(parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size) > 1:
             raise ValueError("avsg_config requires an unsharded context on each rank")
         if parallel.world_size * parallel.data_parallel_size > 1 and "{rank}" not in self.endpoint_file:
@@ -859,7 +861,7 @@ class AscendConfig:
     # pydantic after-validator). Preserves the original __init__ ordering —
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
-        self.avsg_config.validate(vc, self.sparse_kv_offload_config.enabled)
+        self.avsg_config.validate(vc, self.sparse_kv_offload_config.enabled, self.kvpp_config.size)
         validate_expert_offload_config(self.expert_offload_config, vc, self)
         if self.shared_engram is not None and self.shared_engram.backend in ("a2", "a5"):
             if getattr(vc, "shutdown_timeout", 0) <= 0:
