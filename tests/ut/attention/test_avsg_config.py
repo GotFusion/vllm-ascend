@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from pydantic import ValidationError
+from vllm.config import CompilationMode, CUDAGraphMode
 
 from vllm_ascend.ascend_config import AscendConfig, AvsgConfig, SparseKVOffloadConfig
 
@@ -22,6 +23,12 @@ def _glm_config():
             world_size=2, data_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
         ),
         cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            splitting_ops=None,
+            use_inductor_graph_partition=False,
+        ),
         attention_config=SimpleNamespace(hisparse_config=None),
         speculative_config=None,
         kv_transfer_config=None,
@@ -68,3 +75,48 @@ def test_avsg_requires_matching_hardware_and_distinct_endpoints():
 def test_avsg_rejects_kv_layer_parallelism():
     with patch("vllm_ascend.ascend_config.is_950", return_value=True), pytest.raises(ValueError, match="KVPP"):
         AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(_glm_config(), False, kvpp_size=2)
+
+
+@pytest.mark.parametrize("mode", list(CUDAGraphMode))
+def test_avsg_graph_execution_requires_strict_piecewise(mode):
+    cfg = AvsgConfig(endpoint_file="/endpoints/{rank}.json")
+    vc = _glm_config()
+    vc.model_config.enforce_eager = False
+    vc.compilation_config.cudagraph_mode = mode
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True):
+        if mode == CUDAGraphMode.PIECEWISE:
+            cfg.validate(vc, False)
+            vc.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        with pytest.raises(ValueError, match="VLLM_COMPILE.*PIECEWISE"):
+            cfg.validate(vc, False)
+
+
+def test_avsg_worker_uses_resolved_mla_split():
+    cfg = AvsgConfig(endpoint_file="/endpoints/{rank}.json")
+    vc = _glm_config()
+    cfg.validate_worker_graph(vc)  # Eager has no FX graph.
+    vc.model_config.enforce_eager = False
+    vc.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    with pytest.raises(ValueError, match="mla_forward"):
+        cfg.validate_worker_graph(vc)
+    vc.compilation_config.splitting_ops = ["vllm::mla_forward"]
+    cfg.validate_worker_graph(vc)
+    vc.compilation_config.use_inductor_graph_partition = True
+    with pytest.raises(ValueError, match="mla_forward"):
+        cfg.validate_worker_graph(vc)
+    vc.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    with pytest.raises(ValueError, match="model runner resolved"):
+        cfg.validate_worker_graph(vc)
+
+
+def test_avsg_rejects_xlite_and_speculation_in_piecewise():
+    cfg = AvsgConfig(endpoint_file="/endpoints/{rank}.json")
+    vc = _glm_config()
+    vc.model_config.enforce_eager = False
+    vc.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True):
+        with pytest.raises(ValueError, match="XLite"):
+            cfg.validate(vc, False, xlite_enabled=True)
+        vc.speculative_config = SimpleNamespace()
+        with pytest.raises(ValueError, match="speculation"):
+            cfg.validate(vc, False)

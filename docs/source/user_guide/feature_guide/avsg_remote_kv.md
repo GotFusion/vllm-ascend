@@ -4,7 +4,7 @@ On Ascend 950, each GLM-5.2 model worker can keep its complete per-layer main KV
 
 The worker publishes new rows to the peer before attention. For each query in prefill, chunked prefill, decode or a mixed batch, it maps the indexer's causally visible positions through that request's physical page table and reads the selected rows over HIXL URMA. Prefix cache hits use the same remote page IDs. The available peer pages and the HBM available to the local indexer limit the scheduler's block count.
 
-Use eager execution, BF16 main KV, one context partition per rank and locally produced KV. The indexer's KV dtype remains independently configurable. Speculative decoding, KV connectors (including disaggregated prefill/decode), HiSparse, KV layer parallelism, host KV offload and sleep mode are incompatible with this configuration.
+Use BF16 main KV, one context partition per rank and locally produced KV. The worker accepts eager execution or explicit PIECEWISE compilation. The indexer's KV dtype remains independently configurable. Speculative decoding, KV connectors (including disaggregated prefill/decode), HiSparse, KV layer parallelism, host KV offload and sleep mode are incompatible with this configuration.
 
 ## Build on Ascend Linux
 
@@ -41,7 +41,7 @@ python -m csrc.avsg_urma.examples.sparse_attention.run serve --config /shared/av
 python -m csrc.avsg_urma.examples.sparse_attention.run run --config /shared/avsg/client.json --mode aclgraph --steps 2 --verify
 ```
 
-Each replay exercises WRITE, the plugin's AvsgMatch, URMA READ and attention. The example checks the selected KV bytes on each layer. The GLM-5.2 serving configuration below uses eager execution with BF16 KV and RoPE.
+Each replay exercises WRITE, the plugin's AvsgMatch, URMA READ and attention. The example checks the selected KV bytes on each layer. The GLM-5.2 serving configuration below uses BF16 KV and RoPE.
 
 ## Configure each worker and its peer
 
@@ -81,6 +81,8 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" \
   --max-model-len 12288 --max-num-batched-tokens 1024 --max-num-seqs 2 \
   --additional-config '{"avsg_config":{"endpoint_file":"/shared/avsg/endpoint-{rank}.json"}}'
 ```
+
+For piecewise ACLGraph, replace `--enforce-eager` with `--compilation-config '{"mode":3,"cudagraph_mode":"PIECEWISE"}'`. The model replays compiled segments between attention calls. Each `vllm::mla_forward` runs outside capture with the current batch's slot mappings and sequence lengths, and checks its peer transfers before returning. The worker checks the resolved graph mode and the MLA splitting point before warmup. Use the same graph configuration for the local-KV and AVSG runs when comparing them. To verify replay, start the worker with `VLLM_LOGGING_LEVEL=DEBUG` and look for both `Capturing ACL graph (PIECEWISE` and `ACL graph replay is active` in the worker logs.
 
 Run the same checkpoint and command twice, first with `--additional-config '{}'` and then with AVSG enabled. For each run, capture the returned token IDs for the same prompt and generation settings. Set `RESULT_FILE` to `baseline.json` for the first run and `avsg.json` for the second.
 

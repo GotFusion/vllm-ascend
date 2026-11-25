@@ -119,7 +119,7 @@ class KVPPConfig:
 
 @config
 class AvsgConfig:
-    """Select the per-worker peer HBM cache used by eager sparse attention."""
+    """Select the per-worker peer HBM cache used by GLM sparse attention."""
 
     endpoint_file: str | None = Field(default=None, min_length=1)
 
@@ -127,15 +127,26 @@ class AvsgConfig:
     def enabled(self) -> bool:
         return self.endpoint_file is not None
 
-    def validate(self, vc: VllmConfig, host_offload: bool, kvpp_size: int = 1) -> None:
+    def validate(self, vc: VllmConfig, host_offload: bool, kvpp_size: int = 1, *, xlite_enabled: bool = False) -> None:
         if self.endpoint_file is None:
             return
         model = vc.model_config
         parallel = vc.parallel_config
         if not is_950() or model.hf_text_config.model_type != "glm_moe_dsa" or model.hf_text_config.index_topk != 2048:
             raise ValueError("avsg_config requires GLM sparse attention with index_topk=2048 on Ascend 950")
-        if not model.enforce_eager or vc.speculative_config is not None:
-            raise ValueError("avsg_config requires --enforce-eager and single-token decode without speculation")
+        if xlite_enabled:
+            raise ValueError("avsg_config cannot use XLite graph execution")
+        if not model.enforce_eager:
+            from vllm.config import CompilationMode, CUDAGraphMode
+
+            compilation = vc.compilation_config
+            if (
+                compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+                or compilation.mode != CompilationMode.VLLM_COMPILE
+            ):
+                raise ValueError("avsg_config requires --enforce-eager or VLLM_COMPILE with cudagraph_mode=PIECEWISE")
+        if vc.speculative_config is not None:
+            raise ValueError("avsg_config requires single-token decode without speculation")
         if model.enable_sleep_mode:
             raise ValueError("avsg_config requires persistent registered device buffers and cannot use sleep mode")
         if str(model.dtype) != "torch.bfloat16" or vc.cache_config.cache_dtype not in ("auto", "bfloat16"):
@@ -148,6 +159,18 @@ class AvsgConfig:
             raise ValueError("avsg_config requires an unsharded context on each rank")
         if parallel.world_size * parallel.data_parallel_size > 1 and "{rank}" not in self.endpoint_file:
             raise ValueError("avsg_config.endpoint_file must include {rank} for a multi-worker deployment")
+
+    def validate_worker_graph(self, vc: VllmConfig) -> None:
+        # The platform installs FX split points after building AscendConfig. Then
+        # the runner may downgrade PIECEWISE when the loaded model cannot use it.
+        if self.enabled and not vc.model_config.enforce_eager:
+            from vllm.config import CUDAGraphMode
+
+            compilation = vc.compilation_config
+            if compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE:
+                raise ValueError(f"AVSG requested PIECEWISE but the model runner resolved {compilation.cudagraph_mode}")
+            if compilation.use_inductor_graph_partition or "vllm::mla_forward" not in (compilation.splitting_ops or ()):
+                raise ValueError("AVSG PIECEWISE requires vllm::mla_forward as an eager FX split point")
 
 
 @config
@@ -861,7 +884,12 @@ class AscendConfig:
     # pydantic after-validator). Preserves the original __init__ ordering —
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
-        self.avsg_config.validate(vc, self.sparse_kv_offload_config.enabled, self.kvpp_config.size)
+        self.avsg_config.validate(
+            vc,
+            self.sparse_kv_offload_config.enabled,
+            self.kvpp_config.size,
+            xlite_enabled=self.xlite_graph_config.enabled,
+        )
         validate_expert_offload_config(self.expert_offload_config, vc, self)
         if self.shared_engram is not None and self.shared_engram.backend in ("a2", "a5"):
             if getattr(vc, "shutdown_timeout", 0) <= 0:

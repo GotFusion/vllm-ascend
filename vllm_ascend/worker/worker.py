@@ -1368,6 +1368,8 @@ class NPUWorker(GPUWorker):
             kv_cache_config,
             kv_cache_allocation_context=self._maybe_get_memory_pool_context(tag="kv_cache"),
         )
+        if self._avsg_endpoint_file is not None:
+            get_ascend_config().avsg_config.validate_worker_graph(self.vllm_config)
 
         # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
         # set, so its worker-side consumer must use the same condition.

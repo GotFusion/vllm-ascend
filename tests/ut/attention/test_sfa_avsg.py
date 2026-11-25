@@ -102,6 +102,8 @@ def test_dummy_attention_does_not_use_remote_or_address_unused_logical_pages():
         slot_mapping=torch.tensor([7, 3, 4, -1]),
     )
     query = torch.ones(3, 1, 2)
+    assert (impl._get_sfa_kv_slot_mapping(metadata) == -1).all()
+    impl.avsg_transport.staging_slots.assert_not_called()
     impl._on_kv_cache_written((), metadata)
     with patch.object(DeviceOperator, "execute_sparse_flash_attention_process") as native:
         result = impl._execute_sparse_flash_attention_process(query, query, (), None, metadata, None, None)
@@ -117,8 +119,17 @@ def test_profiling_forward_without_transport_or_kv_cache():
     impl.enable_sparse_sfa_turboquant = False
     hidden = torch.ones(2, 4)
     output = torch.ones_like(hidden)
-    assert impl.forward("model.layers.3", hidden, None, None, output) is output
+    with patch.object(torch, "npu", create=True) as npu:
+        npu.is_current_stream_capturing.return_value = False
+        assert impl.forward("model.layers.3", hidden, None, None, output) is output
     assert torch.equal(output, torch.zeros_like(output))
+
+
+def test_avsg_refuses_to_capture_dummy_attention():
+    impl = object.__new__(AscendAvsgSFAImpl)
+    with patch.object(torch, "npu", create=True) as npu, pytest.raises(RuntimeError, match="mla_forward"):
+        npu.is_current_stream_capturing.return_value = True
+        impl.forward("model.layers.3", torch.ones(2, 4), (), None)
 
 
 @pytest.mark.parametrize("preprocess_type", ["NATIVE", "PROLOG_V3", "MLAPO"])
@@ -180,11 +191,13 @@ def test_forward_writes_staging_before_publishing_physical_slots(preprocess_type
     impl._finalize_o_proj = lambda x, output: output.copy_(x)
     output = torch.empty_like(hidden)
     with (
+        patch.object(torch, "npu", create=True) as npu,
         patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),
         patch.object(sfa_v1, "notify_kv_cache_written"),
         patch.object(sfa_v1, "attention_transfer_window"),
         patch.object(sfa_v1, "maybe_save_kv_layer_to_connector"),
     ):
+        npu.is_current_stream_capturing.return_value = False
         assert impl.forward(impl.layer_name, hidden, (), metadata, output) is output
     assert torch.equal(hidden, output)
     transport.publish_staged.assert_called_once()
@@ -263,6 +276,6 @@ def test_main_kv_preprocessing_uses_registered_staging_and_preserves_indexer_cac
     composed = impl._compose_sfa_kv_cache(())
     assert composed[:2] == transport.staging_cache
     assert composed[2:] == (indexer_cache if has_indexer else ())
-    slots = impl._get_sfa_kv_slot_mapping(SimpleNamespace(slot_mapping=remote_slots))
+    slots = impl._get_sfa_kv_slot_mapping(SimpleNamespace(slot_mapping=remote_slots, offload_dummy=False))
     transport.staging_slots.assert_called_once_with(remote_slots)
     assert slots.tolist() == [0, 1, -1] and remote_slots.tolist() == [30, 7, -1]

@@ -27,12 +27,22 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         super().__init__(*args, **kwargs)
         self.avsg_layer_id = extract_layer_index(self.layer_name)
 
+    def forward(self, layer_name, hidden_states, kv_cache, attn_metadata, output=None):
+        # In PIECEWISE, vllm::mla_forward must run eagerly even during warmup.
+        # A captured dummy would replay zero attention and skip the peer transfers.
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("AVSG attention cannot run inside ACLGraph capture; keep vllm::mla_forward eager")
+        return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
+
     def _compose_sfa_kv_cache(self, kv_cache):
         # All main-KV preprocessing paths write the registered staging pair.
         # The base class appends the layer's separately allocated indexer cache.
         return super()._compose_sfa_kv_cache(self.avsg_transport.staging_cache)
 
     def _get_sfa_kv_slot_mapping(self, attn_metadata: AscendSFAMetadata) -> torch.Tensor:
+        if attn_metadata.offload_dummy:
+            # A padded graph warmup has no physical rows to publish.
+            return torch.full_like(attn_metadata.slot_mapping, -1)
         return self.avsg_transport.staging_slots(attn_metadata.slot_mapping)
 
     def _on_kv_cache_written(self, kv_cache, attn_metadata: AscendSFAMetadata) -> None:
