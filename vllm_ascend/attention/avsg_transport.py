@@ -58,11 +58,9 @@ class AvsgTransport:
         self.selection_block_table = torch.arange(selection_blocks, device=device, dtype=torch.int32).unsqueeze(0)
         self._one_query = torch.ones(1, device=device, dtype=torch.int32)
         self.decode_graph_capture = False
-        # Capture starts with an inactive slot. The runner updates these three
-        # inputs in place before replay; graph-owned contexts retain their addresses.
-        self.decode_slot = torch.full_like(self._one_query, -1)
-        self.decode_length = torch.zeros_like(self._one_query)
-        self.decode_block_table = torch.zeros((1, decode_graph_blocks), device=device, dtype=torch.int32)
+        self._decode_graph_blocks = decode_graph_blocks
+        self._decode_group_by_layer: dict[int, int] = {}
+        self._decode_inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._decode_read_counts = (
             {layer: torch.full_like(self._one_query, -1) for layer in remote} if decode_graph_blocks else {}
         )
@@ -168,33 +166,52 @@ class AvsgTransport:
             staging.flatten(0, 1).index_copy_(0, local, cache[blocks, offsets])
         self.publish_staged(layer_id, slots)
 
-    def prepare_decode_replay(self, slot_mapping, seq_lens, block_table, *, active: bool = True) -> None:
-        """Refresh the single-request graph inputs and invalidate previous transfer results."""
+    def bind_decode_groups(self, group_by_layer: dict[int, int]) -> None:
+        """Bind each peer layer to its actual vLLM page allocator before capture."""
+        if not self._decode_graph_blocks or group_by_layer.keys() != self._remote_blocks.keys():
+            raise ValueError("AVSG decode groups must cover every peer KV layer")
+        for group in group_by_layer.values():
+            if group not in self._decode_inputs:
+                # The capture keeps these addresses across replays. All layers
+                # using the same allocator can share one copy of the live table.
+                self._decode_inputs[group] = (
+                    torch.full_like(self._one_query, -1),
+                    torch.zeros_like(self._one_query),
+                    self._one_query.new_zeros((1, self._decode_graph_blocks)),
+                )
+        self._decode_group_by_layer = group_by_layer.copy()
+
+    def decode_inputs_for_layer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._decode_inputs[self._decode_group_by_layer[layer_id]]
+
+    def prepare_decode_replay(self, slot_mapping, seq_lens, block_table, *, group_id: int, active: bool = True) -> None:
+        """Refresh a cache group's graph inputs and invalidate its layers' transfer results."""
         if self._closed:
             raise RuntimeError("AVSG transport is closed")
-        if not self.decode_block_table.shape[1]:
-            raise RuntimeError("AVSG decode graph inputs were not configured")
+        slot, length, table = self._decode_inputs[group_id]
         if active:
             if slot_mapping.numel() != 1 or seq_lens.numel() != 1 or block_table.ndim != 2 or block_table.shape[0] != 1:
                 raise ValueError("AVSG FULL decode requires exactly one request and one token")
-            cols = self.decode_block_table.shape[1]
+            cols = table.shape[1]
             if block_table.shape[1] < cols:
                 raise ValueError("AVSG decode graph block table is narrower than the configured context")
-            self.decode_block_table.copy_(block_table[:, :cols])
-            self.decode_length.copy_(seq_lens.view(1))
-            in_bounds = (self.decode_length > 0) & (self.decode_length <= cols * self._block_size)
-            self.decode_slot.copy_(torch.where(in_bounds, slot_mapping.view(1), -1))
+            table.copy_(block_table[:, :cols])
+            length.copy_(seq_lens.view(1))
+            in_bounds = (length > 0) & (length <= cols * self._block_size)
+            slot.copy_(torch.where(in_bounds, slot_mapping.view(1), -1))
         else:
-            self.decode_slot.fill_(-1)
-            self.decode_length.zero_()
-        for layer in self._writes:
+            slot.fill_(-1)
+            length.zero_()
+        for layer, group in self._decode_group_by_layer.items():
+            if group != group_id:
+                continue
             self._writes[layer][-2].fill_(-1)
             self._reads[layer][-1].fill_(-1)
             self._decode_read_counts[layer].fill_(-1)
 
     def publish_decode_graph(self, layer_id: int) -> None:
         """Record a fixed-size WRITE whose live count follows the remote slot on device."""
-        slot = self.decode_slot
+        slot, _, _ = self.decode_inputs_for_layer(layer_id)
         mapping = torch.stack((slot, torch.zeros_like(slot)), dim=-1).view(1, 1, 1, 2)
         count = (slot >= 0).to(torch.int32).view(1, 1)
         rope, kv, context, scratch, seen, status, remote_slots = self._writes[layer_id]
@@ -217,10 +234,14 @@ class AvsgTransport:
         if self._closed:
             raise RuntimeError("AVSG transport is closed")
         try:
-            if not 0 <= self.decode_length.item() <= self.decode_block_table.shape[1] * self._block_size:
-                raise RuntimeError("AVSG decode sequence length exceeds the captured physical page table")
-            expected_writes = int((self.decode_slot >= 0).item())
+            expected_by_group = {}
+            for group in set(self._decode_group_by_layer.values()):
+                slot, length, table = self._decode_inputs[group]
+                if not 0 <= length.item() <= table.shape[1] * self._block_size:
+                    raise RuntimeError("AVSG decode sequence length exceeds the captured physical page table")
+                expected_by_group[group] = int((slot >= 0).item())
             for layer in self._writes:
+                expected_writes = expected_by_group[self._decode_group_by_layer[layer]]
                 written = self._session.check_graph_copy(self._writes[layer][-2])
                 if written != expected_writes:
                     raise RuntimeError(f"AVSG layer {layer} wrote {written} rows, expected {expected_writes}")

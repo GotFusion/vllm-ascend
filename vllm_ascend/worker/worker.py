@@ -1106,7 +1106,7 @@ class NPUWorker(GPUWorker):
         )
         if decode_graph_blocks:
             self.model_runner.avsg_decode_graph_transport = self.avsg_transport
-            self.model_runner.avsg_decode_layer_names = tuple(layer.layer_name for layer in layers)
+            self.model_runner.avsg_decode_layer_ids = {layer.layer_name: layer.avsg_layer_id for layer in layers}
         for layer in layers:
             layer.avsg_transport = self.avsg_transport
         # The selection, staging and registered contexts live as long as the model.

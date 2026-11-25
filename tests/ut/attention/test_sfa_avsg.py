@@ -136,8 +136,10 @@ def test_decode_graph_records_attention_even_for_capture_dummy():
     impl = object.__new__(AscendAvsgSFAImpl)
     impl.avsg_layer_id = 3
     transport = impl.avsg_transport = Mock()
-    transport.decode_slot = torch.tensor([-1], dtype=torch.int32)
-    transport.decode_block_table = torch.tensor([[0]])
+    remote_slot = torch.tensor([-1], dtype=torch.int32)
+    transport.decode_inputs_for_layer.side_effect = {
+        3: (remote_slot, torch.tensor([0]), torch.tensor([[0]]))
+    }.__getitem__
     transport.staging_slots.side_effect = lambda slot: torch.where(slot >= 0, 0, -1)
     metadata = SimpleNamespace(offload_dummy=True, num_actual_tokens=1, num_input_tokens=1, seq_lens=torch.tensor([0]))
     with (
@@ -148,7 +150,7 @@ def test_decode_graph_records_attention_even_for_capture_dummy():
         impl.forward("model.layers.3", hidden, (), metadata)
         base.assert_called_once()
         for live_slot in (-1, 42):
-            transport.decode_slot.fill_(live_slot)
+            remote_slot.fill_(live_slot)
             local = impl._get_sfa_kv_slot_mapping(metadata)
             assert local.tolist() == ([-1] if live_slot < 0 else [0])
             impl._on_kv_cache_written((), metadata)
@@ -179,9 +181,10 @@ def test_fixed_decode_graph_inputs_drive_packed_indices_and_empty_results():
     impl = object.__new__(AscendAvsgSFAImpl)
     impl.avsg_layer_id = 1
     transport = impl.avsg_transport = Mock()
-    transport.decode_slot = torch.tensor([-1], dtype=torch.int32)
-    transport.decode_length = torch.tensor([0], dtype=torch.int32)
-    transport.decode_block_table = torch.zeros((1, 25), dtype=torch.int32)
+    remote_slot = torch.tensor([-1], dtype=torch.int32)
+    remote_length = torch.tensor([0], dtype=torch.int32)
+    remote_table = torch.zeros((1, 25), dtype=torch.int32)
+    transport.decode_inputs_for_layer.side_effect = {1: (remote_slot, remote_length, remote_table)}.__getitem__
     transport.selection_block_table = torch.arange(64, dtype=torch.int32).reshape(1, -1)
     meta = SimpleNamespace(offload_dummy=True, block_size=128)
     topk = torch.full((1, 1, 2048), -1, dtype=torch.int32)
@@ -190,8 +193,8 @@ def test_fixed_decode_graph_inputs_drive_packed_indices_and_empty_results():
     expected = []
 
     def match(local, state, packed, table, seq_len, q_len, _, block_size):
-        assert (state == -1).all() and table is transport.decode_block_table
-        assert seq_len.tolist() == [max(1, int(transport.decode_length[0]))] and q_len.tolist() == [1]
+        assert (state == -1).all() and table is remote_table
+        assert seq_len.tolist() == [max(1, int(remote_length[0]))] and q_len.tolist() == [1]
         assert packed.flatten()[: len(expected)].tolist() == expected
         assert (packed.flatten()[len(expected) :] == -1).all()
         logical = packed.flatten()[: len(expected)].long()
@@ -228,14 +231,14 @@ def test_fixed_decode_graph_inputs_drive_packed_indices_and_empty_results():
             (-1, 0, 0, [0, 1], []),
             (-1, 3073, 1, [0, 1], []),
         ):
-            transport.decode_slot.fill_(slot)
-            transport.decode_length.fill_(length)
-            transport.decode_block_table[0] = (torch.arange(25) + offset) % 25
+            remote_slot.fill_(slot)
+            remote_length.fill_(length)
+            remote_table[0] = (torch.arange(25) + offset) % 25
             topk.fill_(-1)
             topk.flatten()[: len(incoming)] = torch.tensor(incoming)
             original = topk.clone()
             result = impl._execute_sparse_flash_attention_process(q, q, (), topk, meta, None, None)
-            total = sum(int(transport.decode_block_table[0, pos // 128]) * 128 + pos % 128 for pos in expected)
+            total = sum(int(remote_table[0, pos // 128]) * 128 + pos % 128 for pos in expected)
             torch.testing.assert_close(result, torch.full_like(q, total))
             assert torch.equal(topk, original)
 

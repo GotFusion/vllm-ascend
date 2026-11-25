@@ -133,6 +133,7 @@ def transport(tmp_path, monkeypatch):
         dtype=torch.float16,
         decode_graph_blocks=2,
     )
+    adapter.bind_decode_groups({0: 0, 3: 0})
     yield adapter, peer
     adapter.close()
 
@@ -230,20 +231,22 @@ def test_failed_transfer_is_reported(transport, direction):
 def test_decode_graph_inputs_transfers_and_inactive_replay(transport):
     adapter, peer = transport
     kv, rope = adapter.staging_cache
-    graph_inputs = (adapter.decode_slot, adapter.decode_length, adapter.decode_block_table)
+    graph_inputs = adapter.decode_inputs_for_layer(0)
+    slot, length, table = graph_inputs
+    assert graph_inputs is adapter.decode_inputs_for_layer(3)
     pointers = [t.data_ptr() for t in graph_inputs]
     counts = torch.zeros((1, 1), dtype=torch.int32)
     mapping = torch.zeros((1, 1, 1, 2), dtype=torch.int32)
     for step, (remote_slot, num_tokens, pages) in enumerate([(131, 4, [1, 0]), (4, 5, [0, 1]), (-1, 0, None)]):
         if pages is None:
-            adapter.prepare_decode_replay(None, None, None, active=False)
+            adapter.prepare_decode_replay(None, None, None, group_id=0, active=False)
         else:
             adapter.prepare_decode_replay(
-                torch.tensor([remote_slot]), torch.tensor([num_tokens]), torch.tensor([pages])
+                torch.tensor([remote_slot]), torch.tensor([num_tokens]), torch.tensor([pages]), group_id=0
             )
-            assert adapter.decode_block_table.tolist() == [pages]
-        assert adapter.decode_slot.tolist() == [remote_slot]
-        assert adapter.decode_length.tolist() == [num_tokens]
+            assert table.tolist() == [pages]
+        assert slot.tolist() == [remote_slot]
+        assert length.tolist() == [num_tokens]
         assert [t.data_ptr() for t in graph_inputs] == pointers
         for layer in (0, 3):
             val = 20 * (step + 1) + layer
@@ -268,12 +271,12 @@ def test_decode_graph_status_checks_every_layer_and_its_write_dependency(transpo
     counts = torch.ones((1, 1), dtype=torch.int32)
     mapping = torch.zeros((1, 1, 1, 2), dtype=torch.int32)
     inputs = (torch.tensor([0]), torch.tensor([1]), torch.tensor([[0, 1]]))
-    adapter.prepare_decode_replay(*inputs)
+    adapter.prepare_decode_replay(*inputs, group_id=0)
     for layer in (0, 3):
         adapter.publish_decode_graph(layer)
         adapter.gather_decode_graph(layer, mapping, counts)
     adapter.check_decode_graph_status()
-    adapter.prepare_decode_replay(*inputs)
+    adapter.prepare_decode_replay(*inputs, group_id=0)
     for layer in (0, 3):
         peer.failure = failure if layer == 0 else None
         if layer == 0 and failure == "missed layer":
@@ -295,13 +298,13 @@ def test_decode_graph_status_checks_every_layer_and_its_write_dependency(transpo
 def test_decode_graph_rejects_short_physical_page_table(transport):
     adapter, _ = transport
     with pytest.raises(ValueError, match="narrower"):
-        adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([2]), torch.tensor([[0]]))
+        adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([2]), torch.tensor([[0]]), group_id=0)
 
 
 def test_decode_graph_disables_out_of_bounds_context_before_reporting_error(transport):
     adapter, peer = transport
-    adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([257]), torch.tensor([[0, 1]]))
-    assert adapter.decode_slot.tolist() == [-1]
+    adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([257]), torch.tensor([[0, 1]]), group_id=0)
+    assert adapter.decode_inputs_for_layer(0)[0].tolist() == [-1]
     for layer in (0, 3):
         adapter.publish_decode_graph(layer)
     for rows in peer.rows.values():
@@ -309,3 +312,48 @@ def test_decode_graph_disables_out_of_bounds_context_before_reporting_error(tran
     with pytest.raises(RuntimeError, match="captured physical page table"):
         adapter.check_decode_graph_status()
     peer.session.close.assert_called_once()
+
+
+def test_decode_graph_routes_physical_rows_per_cache_group(transport):
+    adapter, peer = transport
+    groups = {0: 5, 3: 9}
+    adapter.bind_decode_groups(groups)
+    captured = {layer: adapter.decode_inputs_for_layer(layer) for layer in groups}
+    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(captured[0], captured[3]))
+    adapter.bind_decode_groups(groups)
+    assert all(adapter.decode_inputs_for_layer(layer) is inputs for layer, inputs in captured.items())
+    with pytest.raises(ValueError, match="every peer KV layer"):
+        adapter.bind_decode_groups({0: 5})
+    kv, rope = adapter.staging_cache
+    # The same two logical token positions use opposite physical pages. Then
+    # deactivate just one group to detect accidental worker-wide slot gating.
+    for step, position in enumerate((3, 128, 129)):
+        for layer, group in groups.items():
+            pages = [0, 1] if layer == 3 else [1, 0]
+            physical = pages[position // 128] * 128 + position % 128
+            adapter.prepare_decode_replay(
+                torch.tensor([physical]),
+                torch.tensor([position + 1]),
+                torch.tensor([pages]),
+                group_id=group,
+                active=layer == 3 or step < 2,
+            )
+        for layer, (slot, length, table) in captured.items():
+            active = layer == 3 or step < 2
+            assert int(length[0]) == (position + 1 if active else 0)
+            physical = int(table[0, position // 128]) * 128 + position % 128
+            assert int(slot[0]) == (physical if active else -1)
+            value = 20 * (step + 1) + layer
+            kv[0, 0].fill_(value)
+            rope[0, 0].fill_(-value)
+            adapter.publish_decode_graph(layer)
+            mapping = torch.tensor([[[[physical, 0]]]], dtype=torch.int32)
+            counts = torch.tensor([[int(active)]], dtype=torch.int32)
+            selected, _ = adapter.gather_decode_graph(layer, mapping, counts)
+            if active:
+                assert selected[0, 0].tolist() == [[value, value]]
+        adapter.check_decode_graph_status()
+    first, _ = peer.rows[8192]
+    second, _ = peer.rows[4 * 8192]
+    assert first[[131, 0, 1], 0].tolist() == [20, 40, 0]
+    assert second[[3, 128, 129], 0].tolist() == [23, 43, 63]

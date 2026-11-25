@@ -50,7 +50,6 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
                 or attn_metadata.num_input_tokens != 1
                 or attn_metadata.num_actual_tokens != 1
                 or attn_metadata.seq_lens.numel() != 1
-                or not self.avsg_transport.decode_block_table.shape[1]
             ):
                 raise RuntimeError("AVSG FULL decode requires one request and one token with graph inputs")
         elif torch.npu.is_current_stream_capturing():
@@ -64,7 +63,8 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
 
     def _get_sfa_kv_slot_mapping(self, attn_metadata: AscendSFAMetadata) -> torch.Tensor:
         if self._in_full_decode():
-            return self.avsg_transport.staging_slots(self.avsg_transport.decode_slot)
+            slot, _, _ = self.avsg_transport.decode_inputs_for_layer(self.avsg_layer_id)
+            return self.avsg_transport.staging_slots(slot)
         if attn_metadata.offload_dummy:
             # A padded graph warmup has no physical rows to publish.
             return torch.full_like(attn_metadata.slot_mapping, -1)
@@ -81,10 +81,11 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
 
     def _execute_decode_graph(self, ql_nope, q_pe, topk_indices, attn_metadata):
         transport = self.avsg_transport
+        slot, length, block_table = transport.decode_inputs_for_layer(self.avsg_layer_id)
         selection_table = transport.selection_block_table
         selection_slots = selection_table.shape[1] * attn_metadata.block_size
         indices = topk_indices.reshape(1, 1, -1).to(torch.int32)
-        valid = (transport.decode_slot >= 0) & (indices >= 0) & (indices < transport.decode_length)
+        valid = (slot >= 0) & (indices >= 0) & (indices < length)
         # Stably move valid indices to the prefix with a permutation of fixed
         # size. Match mutates its input; other layers reuse the indexer's tensor.
         prefix = valid.cumsum(-1, dtype=torch.int32)
@@ -94,13 +95,13 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         remapped = torch.empty_like(indices).scatter_(-1, destination.long(), torch.where(valid, indices, -1))
         # Match skips initialization when the logical length is zero. Length
         # one plus an all-padding top-k represents a completed, empty transfer.
-        seq_len = transport.decode_length.clamp(1, transport.decode_block_table.shape[1] * attn_metadata.block_size)
+        seq_len = length.clamp(1, block_table.shape[1] * attn_metadata.block_size)
         query_len = selection_table.new_ones(1)
         _, mapping, counts = torch.ops._C_ascend.npu_avsg_match(
             selection_table,
             selection_table.new_full((1, 2 * selection_slots), -1),
             remapped,
-            transport.decode_block_table,
+            block_table,
             seq_len,
             query_len,
             1,

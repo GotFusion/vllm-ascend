@@ -120,16 +120,36 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.avsg_transport is not None:
             if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY or self.capture_sizes != [1]:
                 raise ValueError("AVSG FULL_DECODE_ONLY requires exactly one single-token capture")
-            # AttentionGroup builds one metadata object for all its target
-            # layers. Different cache groups may have independent page IDs.
-            layer_names = set(model_runner.avsg_decode_layer_names)
-            if not any(
-                layer_names.issubset(group.layer_names) for groups in model_runner.attn_groups for group in groups
-            ):
-                raise ValueError("AVSG FULL_DECODE_ONLY requires one attention group for all peer KV layers")
-            self.avsg_layer_name = model_runner.avsg_decode_layer_names[0]
+            self._bind_avsg_groups(model_runner.avsg_decode_layer_ids, model_runner.attn_groups)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+
+    def _bind_avsg_groups(self, layer_ids: dict[str, int], attn_groups: list[list[AttentionGroup]]) -> None:
+        # Each AttentionGroup builds one metadata object shared by its target
+        # layers. A layer reusing its predecessor's logical top-k indices can
+        # still have its own physical main-KV pages.
+        group_by_layer = {}
+        bound_layers: dict[str, int] = {}
+        self.avsg_group_sources: dict[int, str] = {}
+        for groups in attn_groups:
+            for group in groups:
+                names = [name for name in group.layer_names if name in layer_ids]
+                if not names:
+                    continue
+                source = min(names, key=layer_ids.__getitem__)
+                group_id = layer_ids[source]
+                self.avsg_group_sources[group_id] = source
+                for name in names:
+                    layer_id = layer_ids[name]
+                    if layer_id in group_by_layer:
+                        raise ValueError(f"AVSG peer layer {name} has ambiguous attention group membership")
+                    group_by_layer[layer_id] = group_id
+                    bound_layers[name] = layer_id
+        missing = sorted(layer_ids.keys() - bound_layers)
+        if missing or not group_by_layer:
+            raise ValueError(f"AVSG peer layers are missing from the model attention groups: {missing}")
+        self.avsg_transport.bind_decode_groups(group_by_layer)
+        self.avsg_layer_ids = bound_layers
 
     @classmethod
     def validate_avsg_binding(cls, model_runner, transport: "AvsgTransport") -> None:
@@ -137,7 +157,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if (
             not isinstance(manager, cls)
             or manager.avsg_transport is not transport
-            or manager.avsg_layer_name not in model_runner.avsg_decode_layer_names
+            or manager.avsg_layer_ids != model_runner.avsg_decode_layer_ids
         ):
             raise RuntimeError("AVSG FULL_DECODE_ONLY requires the model graph manager to own the active transport")
 
@@ -158,13 +178,15 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             if self.avsg_transport is not None:
                 if desc.num_tokens != 1 or desc.num_reqs != 1:
                     raise RuntimeError("AVSG FULL replay requires one query token and one request")
-                sfa = attn_metadata[self.avsg_layer_name]
-                self.avsg_transport.prepare_decode_replay(
-                    sfa.slot_mapping,
-                    sfa.seq_lens,
-                    sfa.block_table,
-                    active=not sfa.offload_dummy and sfa.num_actual_tokens == 1,
-                )
+                for group_id, layer_name in self.avsg_group_sources.items():
+                    sfa = attn_metadata[layer_name]
+                    self.avsg_transport.prepare_decode_replay(
+                        sfa.slot_mapping,
+                        sfa.seq_lens,
+                        sfa.block_table,
+                        active=not sfa.offload_dummy and sfa.num_actual_tokens == 1,
+                        group_id=group_id,
+                    )
             prepare_engram = getattr(self.model_runner.model_state, "prepare_engram", None)
             if prepare_engram is not None:
                 # Match FULL replay's DP padding before lookup consumes it.
@@ -260,7 +282,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.avsg_transport is not None:
             # Warmup and capture both see a no-op transfer plan. Replay
             # refreshes these same device buffers with the live request.
-            self.avsg_transport.prepare_decode_replay(None, None, None, active=False)
+            for group_id in self.avsg_group_sources:
+                self.avsg_transport.prepare_decode_replay(None, None, None, active=False, group_id=group_id)
         metadata = getattr(model_state, "device_metadata", None)
         model = ModelWithContext(model, device_metadata=metadata)
         legacy_kwargs = {"has_lora": has_lora} if vllm_version_is("0.33.0") else {}
