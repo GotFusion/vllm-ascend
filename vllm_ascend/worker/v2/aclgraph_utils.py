@@ -18,7 +18,7 @@
 #
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -49,6 +49,9 @@ from vllm_ascend.compilation.updatable_graph import (
 from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 from vllm_ascend.utils import use_updatable_graph, vllm_version_is
 from vllm_ascend.worker.v2.utils import communicator_switch
+
+if TYPE_CHECKING:
+    from vllm_ascend.attention.avsg_transport import AvsgTransport
 
 
 def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
@@ -84,6 +87,8 @@ def _get_graph_update_backend(
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
+    avsg_transport: "AvsgTransport | None" = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -111,8 +116,30 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.update_stream = self.model_runner.update_stream
         expert_offload.prepare_graph_capture(self, super().needs_capture)
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
+        self.avsg_transport = getattr(model_runner, "avsg_decode_graph_transport", None)
+        if self.avsg_transport is not None:
+            if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY or self.capture_sizes != [1]:
+                raise ValueError("AVSG FULL_DECODE_ONLY requires exactly one single-token capture")
+            # AttentionGroup builds one metadata object for all its target
+            # layers. Different cache groups may have independent page IDs.
+            layer_names = set(model_runner.avsg_decode_layer_names)
+            if not any(
+                layer_names.issubset(group.layer_names) for groups in model_runner.attn_groups for group in groups
+            ):
+                raise ValueError("AVSG FULL_DECODE_ONLY requires one attention group for all peer KV layers")
+            self.avsg_layer_name = model_runner.avsg_decode_layer_names[0]
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+
+    @classmethod
+    def validate_avsg_binding(cls, model_runner, transport: "AvsgTransport") -> None:
+        manager = model_runner.cudagraph_manager
+        if (
+            not isinstance(manager, cls)
+            or manager.avsg_transport is not transport
+            or manager.avsg_layer_name not in model_runner.avsg_decode_layer_names
+        ):
+            raise RuntimeError("AVSG FULL_DECODE_ONLY requires the model graph manager to own the active transport")
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -128,6 +155,16 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
         metadata = getattr(self.model_runner.model_state, "device_metadata", None)
         try:
+            if self.avsg_transport is not None:
+                if desc.num_tokens != 1 or desc.num_reqs != 1:
+                    raise RuntimeError("AVSG FULL replay requires one query token and one request")
+                sfa = attn_metadata[self.avsg_layer_name]
+                self.avsg_transport.prepare_decode_replay(
+                    sfa.slot_mapping,
+                    sfa.seq_lens,
+                    sfa.block_table,
+                    active=not sfa.offload_dummy and sfa.num_actual_tokens == 1,
+                )
             prepare_engram = getattr(self.model_runner.model_state, "prepare_engram", None)
             if prepare_engram is not None:
                 # Match FULL replay's DP padding before lookup consumes it.
@@ -145,10 +182,15 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 ):
                     prepare_engram()
             if use_updatable_graph(attn_backend):
-                return self._updatable_graph_replay(desc, attn_metadata)
+                result = self._updatable_graph_replay(desc, attn_metadata)
             else:
                 # This will be removed once the refactoring is fully complete.
-                return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+                result = self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+            if self.avsg_transport is not None:
+                # All layers have drained on this stream. Check before the
+                # runner consumes hidden states or emits a sampled token.
+                self.avsg_transport.check_decode_graph_status()
+            return result
         finally:
             if metadata is not None:
                 metadata.finish_replay()
@@ -215,10 +257,18 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
+        if self.avsg_transport is not None:
+            # Warmup and capture both see a no-op transfer plan. Replay
+            # refreshes these same device buffers with the live request.
+            self.avsg_transport.prepare_decode_replay(None, None, None, active=False)
         metadata = getattr(model_state, "device_metadata", None)
         model = ModelWithContext(model, device_metadata=metadata)
         legacy_kwargs = {"has_lora": has_lora} if vllm_version_is("0.33.0") else {}
         try:
+            if self.avsg_transport is not None:
+                # The outer V2 full graph runs model() with runtime mode NONE
+                # during both its warmup and its native capture.
+                self.avsg_transport.decode_graph_capture = True
             with communicator_switch():
                 return super().capture(
                     model,
@@ -235,6 +285,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     progress_bar_desc=progress_bar_desc,
                 )
         finally:
+            if self.avsg_transport is not None:
+                self.avsg_transport.decode_graph_capture = False
             # Input preparation can fail before ModelWithContext.forward runs.
             if metadata is not None:
                 metadata.finish()

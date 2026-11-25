@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from vllm_ascend.attention import sfa_v1
+from vllm_ascend.attention import sfa_avsg, sfa_v1
 from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
 from vllm_ascend.device.device_op import DeviceOperator
 
@@ -130,6 +130,114 @@ def test_avsg_refuses_to_capture_dummy_attention():
     with patch.object(torch, "npu", create=True) as npu, pytest.raises(RuntimeError, match="mla_forward"):
         npu.is_current_stream_capturing.return_value = True
         impl.forward("model.layers.3", torch.ones(2, 4), (), None)
+
+
+def test_decode_graph_records_attention_even_for_capture_dummy():
+    impl = object.__new__(AscendAvsgSFAImpl)
+    impl.avsg_layer_id = 3
+    transport = impl.avsg_transport = Mock()
+    transport.decode_slot = torch.tensor([-1], dtype=torch.int32)
+    transport.decode_block_table = torch.tensor([[0]])
+    transport.staging_slots.side_effect = lambda slot: torch.where(slot >= 0, 0, -1)
+    metadata = SimpleNamespace(offload_dummy=True, num_actual_tokens=1, num_input_tokens=1, seq_lens=torch.tensor([0]))
+    with (
+        patch.object(impl, "_in_full_decode", return_value=True),
+        patch.object(sfa_v1.AscendSFAImpl, "forward") as base,
+    ):
+        hidden = torch.ones(1, 4)
+        impl.forward("model.layers.3", hidden, (), metadata)
+        base.assert_called_once()
+        for live_slot in (-1, 42):
+            transport.decode_slot.fill_(live_slot)
+            local = impl._get_sfa_kv_slot_mapping(metadata)
+            assert local.tolist() == ([-1] if live_slot < 0 else [0])
+            impl._on_kv_cache_written((), metadata)
+            transport.publish_decode_graph.assert_called_with(3)
+        metadata.num_actual_tokens = 0
+        with pytest.raises(RuntimeError, match="one request and one token"):
+            impl.forward("model.layers.3", hidden, (), metadata)
+
+
+def test_full_decode_capture_scope_accepts_pinned_vllm_none_mode():
+    impl = object.__new__(AscendAvsgSFAImpl)
+    transport = impl.avsg_transport = SimpleNamespace(decode_graph_capture=False)
+    context = SimpleNamespace(cudagraph_runtime_mode=sfa_avsg.CUDAGraphMode.NONE)
+    with (
+        patch.object(sfa_avsg, "is_forward_context_available", return_value=True),
+        patch.object(sfa_avsg, "get_forward_context", return_value=context),
+    ):
+        assert not impl._in_full_decode()
+        transport.decode_graph_capture = True
+        assert impl._in_full_decode()
+        context.cudagraph_runtime_mode = sfa_avsg.CUDAGraphMode.PIECEWISE
+        assert not impl._in_full_decode()
+        context.cudagraph_runtime_mode = sfa_avsg.CUDAGraphMode.FULL
+        assert impl._in_full_decode()
+
+
+def test_fixed_decode_graph_inputs_drive_packed_indices_and_empty_results():
+    impl = object.__new__(AscendAvsgSFAImpl)
+    impl.avsg_layer_id = 1
+    transport = impl.avsg_transport = Mock()
+    transport.decode_slot = torch.tensor([-1], dtype=torch.int32)
+    transport.decode_length = torch.tensor([0], dtype=torch.int32)
+    transport.decode_block_table = torch.zeros((1, 25), dtype=torch.int32)
+    transport.selection_block_table = torch.arange(64, dtype=torch.int32).reshape(1, -1)
+    meta = SimpleNamespace(offload_dummy=True, block_size=128)
+    topk = torch.full((1, 1, 2048), -1, dtype=torch.int32)
+    q = torch.ones((1, 2, 3))
+    selected = torch.empty(8192)
+    expected = []
+
+    def match(local, state, packed, table, seq_len, q_len, _, block_size):
+        assert (state == -1).all() and table is transport.decode_block_table
+        assert seq_len.tolist() == [max(1, int(transport.decode_length[0]))] and q_len.tolist() == [1]
+        assert packed.flatten()[: len(expected)].tolist() == expected
+        assert (packed.flatten()[len(expected) :] == -1).all()
+        logical = packed.flatten()[: len(expected)].long()
+        physical = table[0, logical // block_size] * block_size + logical % block_size
+        packed.flatten()[: len(expected)] = torch.arange(len(expected), dtype=torch.int32)
+        pairs = torch.zeros((1, 1, 2048, 2), dtype=torch.int32)
+        pairs[0, 0, : len(expected), 0] = physical
+        # If Match reports a bogus nonzero count for the dummy shape, no READ may run.
+        return None, pairs, torch.tensor([[len(expected) or 1]], dtype=torch.int32)
+
+    def gather(layer, pairs, count):
+        assert layer == 1 and count.tolist() == [[len(expected)]]
+        selected.fill_(float("nan"))
+        selected[: len(expected)].copy_(pairs[0, 0, : len(expected), 0])
+        return selected, selected
+
+    def sfa(owner, q, qr, caches, indices, metadata, q_len, kv_len, *, block_table, sparse_mode, return_lse):
+        assert owner is impl and sparse_mode == 0 and return_lse
+        assert block_table is transport.selection_block_table
+        valid = indices.flatten()[indices.flatten() >= 0].long()
+        assert valid.tolist() == list(range(max(1, len(expected))))
+        return caches[0][valid].sum().expand_as(q), None, None
+
+    transport.gather_decode_graph.side_effect = gather
+    with (
+        patch.object(impl, "_in_full_decode", return_value=True),
+        patch.object(torch.ops._C_ascend, "npu_avsg_match", side_effect=match, create=True),
+        patch.object(DeviceOperator, "execute_sparse_flash_attention_process", side_effect=sfa),
+    ):
+        for slot, length, offset, incoming, expected in (
+            (3, 3072, 1, [-1, 177, 3072, 3, -2, 788, 0], [177, 3, 788, 0]),
+            (6, 3073, 2, [3072, 3073, -1, 129, 1], [3072, 129, 1]),
+            (6, 3073, 2, [3073, -1], []),
+            (-1, 0, 0, [0, 1], []),
+            (-1, 3073, 1, [0, 1], []),
+        ):
+            transport.decode_slot.fill_(slot)
+            transport.decode_length.fill_(length)
+            transport.decode_block_table[0] = (torch.arange(25) + offset) % 25
+            topk.fill_(-1)
+            topk.flatten()[: len(incoming)] = torch.tensor(incoming)
+            original = topk.clone()
+            result = impl._execute_sparse_flash_attention_process(q, q, (), topk, meta, None, None)
+            total = sum(int(transport.decode_block_table[0, pos // 128]) * 128 + pos % 128 for pos in expected)
+            torch.testing.assert_close(result, torch.full_like(q, total))
+            assert torch.equal(topk, original)
 
 
 @pytest.mark.parametrize("preprocess_type", ["NATIVE", "PROLOG_V3", "MLAPO"])

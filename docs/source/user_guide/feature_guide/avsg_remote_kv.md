@@ -4,7 +4,7 @@ On Ascend 950, each GLM-5.2 model worker can keep its complete per-layer main KV
 
 The worker publishes new rows to the peer before attention. For each query in prefill, chunked prefill, decode or a mixed batch, it maps the indexer's causally visible positions through that request's physical page table and reads the selected rows over HIXL URMA. Prefix cache hits use the same remote page IDs. The available peer pages and the HBM available to the local indexer limit the scheduler's block count.
 
-Use BF16 main KV, one context partition per rank and locally produced KV. The worker accepts eager execution or explicit PIECEWISE compilation. The indexer's KV dtype remains independently configurable. Speculative decoding, KV connectors (including disaggregated prefill/decode), HiSparse, KV layer parallelism, host KV offload and sleep mode are incompatible with this configuration.
+Use BF16 main KV, one context partition per rank and locally produced KV. The worker accepts eager execution, PIECEWISE compilation, and single-request FULL_DECODE_ONLY graphs. The indexer's KV dtype remains independently configurable. Speculative decoding, KV connectors (including disaggregated prefill/decode), HiSparse, KV layer parallelism, host KV offload and sleep mode are incompatible with this configuration.
 
 ## Build on Ascend Linux
 
@@ -83,6 +83,8 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" \
 ```
 
 For piecewise ACLGraph, replace `--enforce-eager` with `--compilation-config '{"mode":3,"cudagraph_mode":"PIECEWISE"}'`. The model replays compiled segments between attention calls. Each `vllm::mla_forward` runs outside capture with the current batch's slot mappings and sequence lengths, and checks its peer transfers before returning. The worker checks the resolved graph mode and the MLA splitting point before warmup. Use the same graph configuration for the local-KV and AVSG runs when comparing them. To verify replay, start the worker with `VLLM_LOGGING_LEVEL=DEBUG` and look for both `Capturing ACL graph (PIECEWISE` and `ACL graph replay is active` in the worker logs.
+
+To capture attention and its peer transfers along with the rest of a single-token Decode, replace `--enforce-eager` with `--compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'`. This configuration requires DP1, PP1, one main-KV attention group per worker, and `--max-model-len` up to 16384 (128 kernel pages). It captures one request with one query token. Multi-token prefill and batches outside the capture size execute eagerly. Each replay refreshes the worker's slot, sequence length and block table before running WRITE, Match, READ and sparse attention. The worker checks each layer's completed transfers before sampling. Use TP1 for a two-NPU validation (one model worker and one peer).
 
 Run the same checkpoint and command twice, first with `--additional-config '{}'` and then with AVSG enabled. For each run, capture the returned token IDs for the same prompt and generation settings. Set `RESULT_FILE` to `baseline.json` for the first run and `avsg.json` for the second.
 

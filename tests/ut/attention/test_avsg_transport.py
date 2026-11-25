@@ -40,16 +40,19 @@ class MemoryPeer:
 
     def prepare_write(self, *, layer_id, source, mapping_capacity, workspace=None):
         kv, rope = self.source
-        return rope, kv, self.base, None, None, torch.zeros(1), self.slots
+        return rope, kv, self.base, None, None, torch.full((2,), -1), self.slots
 
     def prepare_read(self, *, layer_id, mapping_capacity, workspace=None):
         kv, rope = self.selection
-        return rope, kv, self.base, None, None, torch.zeros(1)
+        return rope, kv, self.base, None, None, torch.full((2,), -1)
 
     def transfer(self, direction, rope, kv, q, mapping, count, base, scratch, seen, status, *args):
         assert mapping.dtype == count.dtype == q.dtype == torch.int32
         active_groups = int(q[-1]) * count.shape[-1]
         assert active_groups <= count.numel()
+        if direction == "read" and args[0] is not None and args[0][0] != 0:
+            status.copy_(torch.tensor([1, 0]))
+            return
         pairs = mapping.reshape(-1, mapping.shape[-2], 2)
         remote_kv, remote_rope = self.rows[base]
         local_kv, local_rope = kv.flatten(0, 1), rope.flatten(0, 1)
@@ -62,12 +65,14 @@ class MemoryPeer:
                 else:
                     local_kv[local].copy_(remote_kv[remote])
                     local_rope[local].copy_(remote_rope[remote])
-        status.fill_(int(self.failure == direction))
+        status[0] = int(self.failure == direction)
+        status[1] = count.flatten()[:active_groups].sum()
 
     @staticmethod
     def check(status):
-        if status.item():
+        if status[0] != 0:
             raise RuntimeError("peer reported a failed transfer")
+        return int(status[1])
 
 
 @pytest.fixture
@@ -126,6 +131,7 @@ def transport(tmp_path, monkeypatch):
         rope_dim=1,
         max_tokens=4,
         dtype=torch.float16,
+        decode_graph_blocks=2,
     )
     yield adapter, peer
     adapter.close()
@@ -219,3 +225,87 @@ def test_failed_transfer_is_reported(transport, direction):
     peer.session.close.assert_called_once()
     with pytest.raises(RuntimeError, match="closed"):
         adapter.publish(0, kv, rope, torch.tensor([2]))
+
+
+def test_decode_graph_inputs_transfers_and_inactive_replay(transport):
+    adapter, peer = transport
+    kv, rope = adapter.staging_cache
+    graph_inputs = (adapter.decode_slot, adapter.decode_length, adapter.decode_block_table)
+    pointers = [t.data_ptr() for t in graph_inputs]
+    counts = torch.zeros((1, 1), dtype=torch.int32)
+    mapping = torch.zeros((1, 1, 1, 2), dtype=torch.int32)
+    for step, (remote_slot, num_tokens, pages) in enumerate([(131, 4, [1, 0]), (4, 5, [0, 1]), (-1, 0, None)]):
+        if pages is None:
+            adapter.prepare_decode_replay(None, None, None, active=False)
+        else:
+            adapter.prepare_decode_replay(
+                torch.tensor([remote_slot]), torch.tensor([num_tokens]), torch.tensor([pages])
+            )
+            assert adapter.decode_block_table.tolist() == [pages]
+        assert adapter.decode_slot.tolist() == [remote_slot]
+        assert adapter.decode_length.tolist() == [num_tokens]
+        assert [t.data_ptr() for t in graph_inputs] == pointers
+        for layer in (0, 3):
+            val = 20 * (step + 1) + layer
+            kv[0, 0].fill_(val)
+            rope[0, 0].fill_(-val)
+            adapter.publish_decode_graph(layer)
+            counts.fill_(remote_slot >= 0)
+            mapping[..., 0].fill_(remote_slot)
+            selected_kv, selected_rope = adapter.gather_decode_graph(layer, mapping, counts)
+            if remote_slot >= 0:
+                assert selected_kv[0, 0].tolist() == [[val, val]] and selected_rope[0, 0].tolist() == [[-val]]
+        adapter.check_decode_graph_status()
+    for layer in (0, 3):
+        remote_kv, _ = peer.rows[(layer + 1) * 8192]
+        assert remote_kv.count_nonzero() == 4
+        assert remote_kv[[131, 4], 0].tolist() == [20 + layer, 40 + layer]
+
+
+@pytest.mark.parametrize("failure", ["write", "read", "missed layer", "wrong write count", "wrong read count"])
+def test_decode_graph_status_checks_every_layer_and_its_write_dependency(transport, failure):
+    adapter, peer = transport
+    counts = torch.ones((1, 1), dtype=torch.int32)
+    mapping = torch.zeros((1, 1, 1, 2), dtype=torch.int32)
+    inputs = (torch.tensor([0]), torch.tensor([1]), torch.tensor([[0, 1]]))
+    adapter.prepare_decode_replay(*inputs)
+    for layer in (0, 3):
+        adapter.publish_decode_graph(layer)
+        adapter.gather_decode_graph(layer, mapping, counts)
+    adapter.check_decode_graph_status()
+    adapter.prepare_decode_replay(*inputs)
+    for layer in (0, 3):
+        peer.failure = failure if layer == 0 else None
+        if layer == 0 and failure == "missed layer":
+            continue
+        adapter.publish_decode_graph(layer)
+        adapter.gather_decode_graph(layer, mapping, counts)
+        if layer == 0 and failure == "write":
+            # READ saw the failed WRITE status before touching its local selection.
+            assert adapter._reads[0][-1].tolist() == [1, 0]
+        if layer == 0 and failure == "wrong write count":
+            adapter._writes[0][-2][1] = 0
+        if layer == 0 and failure == "wrong read count":
+            adapter._reads[0][-1][1] = 0
+    with pytest.raises(RuntimeError, match="failed transfer|expected 1"):
+        adapter.check_decode_graph_status()
+    peer.session.close.assert_called_once()
+
+
+def test_decode_graph_rejects_short_physical_page_table(transport):
+    adapter, _ = transport
+    with pytest.raises(ValueError, match="narrower"):
+        adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([2]), torch.tensor([[0]]))
+
+
+def test_decode_graph_disables_out_of_bounds_context_before_reporting_error(transport):
+    adapter, peer = transport
+    adapter.prepare_decode_replay(torch.tensor([1]), torch.tensor([257]), torch.tensor([[0, 1]]))
+    assert adapter.decode_slot.tolist() == [-1]
+    for layer in (0, 3):
+        adapter.publish_decode_graph(layer)
+    for rows in peer.rows.values():
+        assert not any(component.count_nonzero() for component in rows)
+    with pytest.raises(RuntimeError, match="captured physical page table"):
+        adapter.check_decode_graph_status()
+    peer.session.close.assert_called_once()

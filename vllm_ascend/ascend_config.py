@@ -38,8 +38,12 @@ from vllm_ascend.distributed.expert_transfer.expert_offload_config import valida
 from vllm_ascend.kv_trace.kv_trace_config import KVTraceConfig
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import CUDAGraphMode, VllmConfig
 
+AVSG_KERNEL_BLOCK_SIZE = 128
+# Match keeps its fixed full table in UB. With one query, 2048 top-k
+# entries and 8192 selection slots, 128 pages use at most 159552 live bytes.
+AVSG_DECODE_GRAPH_MAX_BLOCKS = 128
 _KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "MooncakePushConnector", "AscendStoreConnector")
 _MEGA_MOE_SUPPORTED = None
 
@@ -140,11 +144,15 @@ class AvsgConfig:
             from vllm.config import CompilationMode, CUDAGraphMode
 
             compilation = vc.compilation_config
-            if (
-                compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
-                or compilation.mode != CompilationMode.VLLM_COMPILE
+            if compilation.mode != CompilationMode.VLLM_COMPILE or compilation.cudagraph_mode not in (
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.FULL_DECODE_ONLY,
             ):
-                raise ValueError("avsg_config requires --enforce-eager or VLLM_COMPILE with cudagraph_mode=PIECEWISE")
+                raise ValueError(
+                    "avsg_config requires --enforce-eager or VLLM_COMPILE with PIECEWISE or FULL_DECODE_ONLY"
+                )
+            if compilation.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                self._validate_full_decode(vc)
         if vc.speculative_config is not None:
             raise ValueError("avsg_config requires single-token decode without speculation")
         if model.enable_sleep_mode:
@@ -160,15 +168,33 @@ class AvsgConfig:
         if parallel.world_size * parallel.data_parallel_size > 1 and "{rank}" not in self.endpoint_file:
             raise ValueError("avsg_config.endpoint_file must include {rank} for a multi-worker deployment")
 
-    def validate_worker_graph(self, vc: VllmConfig) -> None:
+    @staticmethod
+    def _validate_full_decode(vc: VllmConfig) -> None:
+        compilation = vc.compilation_config
+        decode_sizes = getattr(compilation, "decode_cudagraph_capture_request_sizes", None)
+        if compilation.cudagraph_capture_sizes != [1] or decode_sizes not in (None, [1]):
+            raise ValueError("AVSG FULL_DECODE_ONLY requires cudagraph_capture_sizes=[1]")
+        if max(vc.parallel_config.data_parallel_size, vc.parallel_config.pipeline_parallel_size) > 1:
+            raise ValueError("AVSG FULL_DECODE_ONLY requires DP1 and PP1")
+        if not 1 <= cdiv(vc.model_config.max_model_len, AVSG_KERNEL_BLOCK_SIZE) <= AVSG_DECODE_GRAPH_MAX_BLOCKS:
+            raise ValueError(f"AVSG FULL_DECODE_ONLY supports at most {AVSG_DECODE_GRAPH_MAX_BLOCKS} main KV pages")
+
+    def validate_worker_graph(self, vc: VllmConfig, requested_mode: CUDAGraphMode | None = None) -> None:
         # The platform installs FX split points after building AscendConfig. Then
         # the runner may downgrade PIECEWISE when the loaded model cannot use it.
         if self.enabled and not vc.model_config.enforce_eager:
             from vllm.config import CUDAGraphMode
 
             compilation = vc.compilation_config
+            if requested_mode is not None and compilation.cudagraph_mode != requested_mode:
+                raise ValueError(
+                    f"AVSG requested {requested_mode} but the model runner resolved {compilation.cudagraph_mode}"
+                )
+            if compilation.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                self._validate_full_decode(vc)
+                return
             if compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE:
-                raise ValueError(f"AVSG requested PIECEWISE but the model runner resolved {compilation.cudagraph_mode}")
+                raise ValueError(f"AVSG model runner resolved unsupported graph mode {compilation.cudagraph_mode}")
             if compilation.use_inductor_graph_partition or "vllm::mla_forward" not in (compilation.splitting_ops or ()):
                 raise ValueError("AVSG PIECEWISE requires vllm::mla_forward as an eager FX split point")
 

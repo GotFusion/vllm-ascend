@@ -85,7 +85,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.device_allocator.sleep_mode_backend  # noqa: F401  (registers camem)
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import AVSG_KERNEL_BLOCK_SIZE, KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core import kv_cache_dtype_handlers  # noqa: F401
 from vllm_ascend.core.kv_cache_interface import get_avsg_cache_block_limit
@@ -219,6 +219,7 @@ class NPUWorker(GPUWorker):
         # init ascend config and soc version
         ascend_config = init_ascend_config(vllm_config)
         self._avsg_endpoint_file = ascend_config.avsg_config.endpoint_file
+        self._avsg_requested_graph_mode = vllm_config.compilation_config.cudagraph_mode
         from vllm_ascend.logger import configure_ascend_file_logging
 
         configure_ascend_file_logging(ascend_config.ascend_log_path)
@@ -1086,17 +1087,26 @@ class NPUWorker(GPUWorker):
             raise RuntimeError("AVSG requires the GLM SFA backend and a plugin built with the Ascend 950 AvsgMatch op")
         allocated = torch.npu.memory_allocated(self.device)
         model = self.vllm_config.model_config.hf_text_config
+        decode_graph_blocks = 0
+        if not self.model_config.enforce_eager and self._avsg_requested_graph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+            decode_graph_blocks = (
+                self.model_config.max_model_len + AVSG_KERNEL_BLOCK_SIZE - 1
+            ) // AVSG_KERNEL_BLOCK_SIZE
         self.avsg_transport = AvsgTransport(
             endpoint_file=endpoint_file,
             rank=get_global_rank(self.parallel_config),
             device=self.device,
             layer_ids=[layer.avsg_layer_id for layer in layers],
-            block_size=128,  # AscendSFA's kernel page size, independent of scheduler group padding.
+            block_size=AVSG_KERNEL_BLOCK_SIZE,
             kv_dim=model.kv_lora_rank,
             rope_dim=model.qk_rope_head_dim,
             max_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=self.vllm_config.model_config.dtype,
+            decode_graph_blocks=decode_graph_blocks,
         )
+        if decode_graph_blocks:
+            self.model_runner.avsg_decode_graph_transport = self.avsg_transport
+            self.model_runner.avsg_decode_layer_names = tuple(layer.layer_name for layer in layers)
         for layer in layers:
             layer.avsg_transport = self.avsg_transport
         # The selection, staging and registered contexts live as long as the model.
@@ -1369,7 +1379,14 @@ class NPUWorker(GPUWorker):
             kv_cache_allocation_context=self._maybe_get_memory_pool_context(tag="kv_cache"),
         )
         if self._avsg_endpoint_file is not None:
-            get_ascend_config().avsg_config.validate_worker_graph(self.vllm_config)
+            get_ascend_config().avsg_config.validate_worker_graph(self.vllm_config, self._avsg_requested_graph_mode)
+            if (
+                not self.model_config.enforce_eager
+                and self._avsg_requested_graph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            ):
+                from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+
+                ModelAclGraphManager.validate_avsg_binding(self.model_runner, self.avsg_transport)
 
         # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
         # set, so its worker-side consumer must use the same condition.

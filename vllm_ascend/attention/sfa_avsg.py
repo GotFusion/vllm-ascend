@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager GLM sparse attention over paged KV held in peer HBM."""
+"""GLM sparse attention over paged KV held in peer HBM."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from itertools import pairwise
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.math_utils import cdiv
 
@@ -27,10 +29,31 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         super().__init__(*args, **kwargs)
         self.avsg_layer_id = extract_layer_index(self.layer_name)
 
+    def _in_full_decode(self) -> bool:
+        if not is_forward_context_available():
+            return False
+        mode = get_forward_context().cudagraph_runtime_mode
+        # Upstream passes NONE to the model during both FULL warmup and
+        # capture. The V2 manager arms only the configured decode graph.
+        transport = getattr(self, "avsg_transport", None)
+        return mode == CUDAGraphMode.FULL or (
+            mode == CUDAGraphMode.NONE and transport is not None and transport.decode_graph_capture
+        )
+
     def forward(self, layer_name, hidden_states, kv_cache, attn_metadata, output=None):
-        # In PIECEWISE, vllm::mla_forward must run eagerly even during warmup.
-        # A captured dummy would replay zero attention and skip the peer transfers.
-        if torch.npu.is_current_stream_capturing():
+        if self._in_full_decode():
+            # The base forward needs a real-shaped query even on inactive capture
+            # warmup so the indexer, projections and peer operations all get recorded.
+            if (
+                attn_metadata is None
+                or hidden_states.shape[0] != 1
+                or attn_metadata.num_input_tokens != 1
+                or attn_metadata.num_actual_tokens != 1
+                or attn_metadata.seq_lens.numel() != 1
+                or not self.avsg_transport.decode_block_table.shape[1]
+            ):
+                raise RuntimeError("AVSG FULL decode requires one request and one token with graph inputs")
+        elif torch.npu.is_current_stream_capturing():
             raise RuntimeError("AVSG attention cannot run inside ACLGraph capture; keep vllm::mla_forward eager")
         return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
 
@@ -40,16 +63,70 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         return super()._compose_sfa_kv_cache(self.avsg_transport.staging_cache)
 
     def _get_sfa_kv_slot_mapping(self, attn_metadata: AscendSFAMetadata) -> torch.Tensor:
+        if self._in_full_decode():
+            return self.avsg_transport.staging_slots(self.avsg_transport.decode_slot)
         if attn_metadata.offload_dummy:
             # A padded graph warmup has no physical rows to publish.
             return torch.full_like(attn_metadata.slot_mapping, -1)
         return self.avsg_transport.staging_slots(attn_metadata.slot_mapping)
 
     def _on_kv_cache_written(self, kv_cache, attn_metadata: AscendSFAMetadata) -> None:
+        if self._in_full_decode():
+            self.avsg_transport.publish_decode_graph(self.avsg_layer_id)
+            return
         if attn_metadata.offload_dummy or not attn_metadata.num_actual_tokens:
             return
         slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
         self.avsg_transport.publish_staged(self.avsg_layer_id, slots)
+
+    def _execute_decode_graph(self, ql_nope, q_pe, topk_indices, attn_metadata):
+        transport = self.avsg_transport
+        selection_table = transport.selection_block_table
+        selection_slots = selection_table.shape[1] * attn_metadata.block_size
+        indices = topk_indices.reshape(1, 1, -1).to(torch.int32)
+        valid = (transport.decode_slot >= 0) & (indices >= 0) & (indices < transport.decode_length)
+        # Stably move valid indices to the prefix with a permutation of fixed
+        # size. Match mutates its input; other layers reuse the indexer's tensor.
+        prefix = valid.cumsum(-1, dtype=torch.int32)
+        count = prefix[..., -1:]
+        ordinal = torch.arange(indices.shape[-1], dtype=torch.int32, device=indices.device)
+        destination = torch.where(valid, prefix - 1, count + ordinal - prefix)
+        remapped = torch.empty_like(indices).scatter_(-1, destination.long(), torch.where(valid, indices, -1))
+        # Match skips initialization when the logical length is zero. Length
+        # one plus an all-padding top-k represents a completed, empty transfer.
+        seq_len = transport.decode_length.clamp(1, transport.decode_block_table.shape[1] * attn_metadata.block_size)
+        query_len = selection_table.new_ones(1)
+        _, mapping, counts = torch.ops._C_ascend.npu_avsg_match(
+            selection_table,
+            selection_table.new_full((1, 2 * selection_slots), -1),
+            remapped,
+            transport.decode_block_table,
+            seq_len,
+            query_len,
+            1,
+            attn_metadata.block_size,
+        )
+        has_rows = count > 0
+        selected = transport.gather_decode_graph(
+            self.avsg_layer_id, mapping, torch.where(has_rows.view(1, 1), counts, 0)
+        )
+        # Give SFA one in-bounds row even for a no-op and discard that output.
+        # This also masks NaNs from a never-written or previously used selection.
+        sparse_indices = torch.where((~has_rows) & (ordinal == 0), 0, remapped)
+        row_output, _, _ = DeviceOperator.execute_sparse_flash_attention_process(
+            self,
+            ql_nope,
+            q_pe,
+            selected,
+            sparse_indices,
+            attn_metadata,
+            query_len,
+            seq_len.clamp_max(selection_slots),
+            block_table=selection_table,
+            sparse_mode=0,
+            return_lse=True,
+        )
+        return torch.where(has_rows, row_output, 0)
 
     def _execute_sparse_flash_attention_process(
         self,
@@ -62,6 +139,8 @@ class AscendAvsgSFAImpl(AscendSFAImpl):
         actual_seq_lengths_key,
         block_table=None,
     ):
+        if self._in_full_decode():
+            return self._execute_decode_graph(ql_nope, q_pe, topk_indices, attn_metadata)
         output = torch.zeros_like(ql_nope)
         if attn_metadata.offload_dummy or not attn_metadata.num_actual_tokens:
             return output
