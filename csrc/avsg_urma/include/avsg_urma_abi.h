@@ -36,6 +36,11 @@ constexpr uint64_t kTransportErrorOffset = 3 * sizeof(uint64_t);
 constexpr uint64_t kBadContext = 100;
 constexpr uint64_t kBadMapping = 101;
 constexpr uint64_t kBadQueue = 102;
+// Graph validation detail in status word 4; word 3 is reserved for transport.
+enum GraphContextDetail : uint32_t {
+    kContextValid = 0, kContextHeader = 1, kContextLayout = 2, kContextKvAddress = 3,
+    kContextKvBytes = 4, kContextRope = 5, kContextLocalSlots = 6, kContextRemoteRegion = 7,
+};
 // Plain POD copied into the raw ASC launcher. No pointers to host stack storage.
 struct LaunchArgs {
     uint64_t context, mapping, counts, scratch, status;

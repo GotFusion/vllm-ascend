@@ -32,6 +32,17 @@ python -m pip install --no-build-isolation ./csrc/avsg_urma
 python -c 'import torch, torch_npu; from avsg_urma import AvsgUrmaSession, AvsgUrmaCacheServer'
 ```
 
+To check the device installation before loading a checkpoint, run the three-layer FP8 sparse-attention example from this checkout. Copy the two JSON templates from `csrc/avsg_urma/examples/sparse_attention/`, fill in each endpoint's HIXL address and communication resources, and point both configurations at a fresh shared manifest. Start the peer first. When it prints `Remote KV ready`, run the client on the model NPU.
+
+```bash
+# Peer
+python -m csrc.avsg_urma.examples.sparse_attention.run serve --config /shared/avsg/server.json
+# Model NPU
+python -m csrc.avsg_urma.examples.sparse_attention.run run --config /shared/avsg/client.json --mode aclgraph --steps 2 --verify
+```
+
+Each replay exercises WRITE, the plugin's AvsgMatch, URMA READ and attention. The example checks the selected KV bytes on each layer. The GLM-5.2 serving configuration below uses eager execution with BF16 KV and RoPE.
+
 ## Configure each worker and its peer
 
 For TP8 with DP1, prepare eight model endpoints and eight corresponding cache servers. Each pair needs a distinct HIXL engine address on each side and a site-provided communication-resource JSON object for each NPU. Share a fresh run directory between the model worker and its peer for their JSON files.

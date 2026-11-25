@@ -194,7 +194,21 @@ template <typename T> void Run(bool rope, const std::vector<int32_t> &counts)
     assert(ValidateGraphCopy(graph) == kBadMapping);
     graph.remoteSlots = 32;
     ++graph.localKv;
-    assert(ValidateGraphCopy(graph) == kBadContext); // Never write an unregistered clone.
+    GraphContextDetail detail = kContextValid;
+    assert(ValidateGraphCopy(graph, 0, &detail) == kBadContext);
+    assert(detail == kContextKvAddress); // Never write an unregistered clone.
+    --graph.localKv;
+    ++graph.localKvBytes;
+    assert(ValidateGraphCopy(graph, 0, &detail) == kBadContext && detail == kContextKvBytes);
+    --graph.localKvBytes;
+    assert(ValidateGraphCopy(graph, 0, &detail) == 0 && detail == kContextValid);
+
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> statusBuffer;
+    pipe.InitBuffer(statusBuffer, kStatusBytes);
+    Status(args.status, kBadContext, kValidate, 0, statusBuffer.Get<uint32_t>(), kContextKvAddress);
+    assert(status[0] == kBadContext && status[1] == kValidate && status[2] == 0);
+    assert(status[3] == 0 && status[4] == kContextKvAddress);
 
     for (uint32_t core = 0; core < cores; ++core) {
         status[core * 16] = 0;

@@ -14,6 +14,17 @@ from .protocol import (DTYPES, HEADER_WORDS, MAX_CHANNELS, graph_bitmap_words,
                        STATUS_BYTES, SYNC_BYTES, TIMING_ROWS, TIMING_WORDS, RemoteCache,
                        pack_context, descriptor_bytes, transfer_plan, device_timing_stats, host_timing_stats)
 
+# Matches GraphContextDetail in avsg_urma_abi.h.
+_GRAPH_CONTEXT_ERRORS = {
+    1: "header or channel configuration mismatch",
+    2: "KV/RoPE format or block size mismatch",
+    3: "local KV address differs from the registered context",
+    4: "local KV byte size differs from the registered context",
+    5: "local RoPE differs from the registered context",
+    6: "local slot capacity differs from the registered context",
+    7: "remote cache region or stride is invalid",
+}
+
 
 def _options(channels, local_comm_res):
     if not isinstance(channels, int) or not 0 < channels <= min(32, MAX_CHANNELS):
@@ -140,6 +151,15 @@ class AvsgUrmaCacheServer(_Endpoint):
             rope_stride0=full_rope.stride(0) * width if full_rope is not None else 0,
             rope_stride1=full_rope.stride(1) * width if full_rope is not None else 0,
         )
+
+    def register_auxiliary_cache(self, cache):
+        """Register a peer staging counterpart without adding a layer to the manifest."""
+        with self._lock:
+            self._check_open()
+            if self._sealed:
+                raise ValueError("register auxiliary memory before publishing the layout")
+            _check_cache(cache, self.device, dim_limit=1024)
+            self._register_storage(cache)
 
     def publish_layout(self):
         """Seal registrations and return JSON-serializable metadata after producer completion.
@@ -399,15 +419,17 @@ class AvsgUrmaSession(_Endpoint):
         """Check completed graph work at its output boundary before using the result."""
         with self._lock:
             self._check_open()
-            rows = status.reshape(len(self._channels), STATUS_BYTES // 8)[:, :3].cpu().tolist()
-            for jetty, (code, phase, _) in enumerate(rows):
+            rows = status.reshape(len(self._channels), STATUS_BYTES // 8)[:, :5].cpu().tolist()
+            for jetty, (code, phase, _, _, detail) in enumerate(rows):
                 if code != 0 or phase != 4:  # kComplete in avsg_urma_abi.h
                     self._poisoned = True
+                    reason = _GRAPH_CONTEXT_ERRORS.get(detail) if code == 100 else None
+                    diagnostic = f" Context check {detail}: {reason}." if reason else ""
                     raise RuntimeError(
                         f"AVSG URMA copy failed: jetty={jetty}, code={code}, phase={phase}. "
-                        "Reset match state and Session."
+                        f"Reset match state and Session.{diagnostic}"
                     )
-            return sum(tokens for _, _, tokens in rows)
+            return sum(row[2] for row in rows)
 
     @property
     def last_transfer_stats(self):

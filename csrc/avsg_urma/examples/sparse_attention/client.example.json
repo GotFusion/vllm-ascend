@@ -1,0 +1,9 @@
+{
+  "device": 0,
+  "local_engine": "CLIENT_IP:PORT",
+  "peer_engine": "SERVER_IP:PORT",
+  "local_comm_res": "/etc/hixlep/local_comm_res_0_0.json",
+  "remote_manifest": "avsg_sparse_manifest.json",
+  "channels": 1,
+  "timeout_ms": 30000
+}

@@ -92,3 +92,28 @@ class StagingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.bind_staging(0, "step", kv[0], None, 1)
         client._owner.register_tensor.assert_not_called()
+
+    def test_auxiliary_registration_does_not_publish_an_extra_layer(self):
+        peer = self.session.AvsgUrmaCacheServer()
+        data = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
+        peer.register_layer(3, data)
+        auxiliary = torch.empty_like(data)
+        peer.register_auxiliary_cache(auxiliary)
+        self.assertIs(peer._owner.register_tensor.call_args.args[0], auxiliary)
+        self.assertEqual(set(peer.publish_layout()), {"3"})
+        with self.assertRaisesRegex(ValueError, "before publishing"):
+            peer.register_auxiliary_cache(auxiliary)
+        self.assertEqual(peer._owner.register_tensor.call_count, 2)
+
+    def test_check_graph_copy_reports_per_channel_context_detail(self):
+        client = self.session.AvsgUrmaSession(channels=2)
+        client._channels = (1, 2)
+        status = torch.zeros((2, self.session.STATUS_BYTES // 8), dtype=torch.int64)
+        status[:, 1] = 4
+        status[:, 2] = torch.tensor([2, 3])
+        self.assertEqual(client.check_graph_copy(status), 5)
+        status[1, :5] = torch.tensor([100, 1, 0, 0, 3])
+        with self.assertRaisesRegex(RuntimeError, r"jetty=1, code=100, phase=1.*Context check 3: local KV address"):
+            client.check_graph_copy(status)
+        with self.assertRaisesRegex(RuntimeError, "closed or failed"):
+            client.check_graph_copy(status)
