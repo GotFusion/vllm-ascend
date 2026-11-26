@@ -4,7 +4,7 @@
 
 配套上游 vLLM 为 `v0.30.0@ced6857a`。AVSG eager 与原生算子从已有适配提交 `a5db3fde8` 迁入，其 recipes 源版本为 `d107a3e106866344c05c6ba58948ab1f196c6169`，HIXL 源版本为 `5ac7f35b4aa916db77aac58ea6d3d5c16e20f5fe`。本轮源码与主机验证记录对应当前分支，设备结果需在该组合上重新取得。
 
-本次迁移先验证 GLM-5.3 的单服务 eager。启用 `VLLM_USE_V2_MODEL_RUNNER=1`、`--enforce-eager` 和 BF16 主 KV。每个计算 rank 对应一个独立 peer。Prefill/Decode 分离、旧 host KV offload、推测解码、上下文并行和图执行尚不属于此接入的支持范围。
+本分支提供 GLM-5.3 单服务和日志中的 Prefill/Decode 分离接入。PD 路径为 P 的 `MultiConnector` producer → D 的 `SfaRemoteD2HConnector` consumer → AVSG peer HBM；D 保留本地 indexer，使用 AVSG 读取历史主 KV。P/D 均启用 `VLLM_USE_V2_MODEL_RUNNER=1`、`--enforce-eager` 和 BF16 主 KV，本轮 PD 限定两端 TP1、PP1。下面示例使用 DP1 和一个 D peer。旧 host KV offload、推测解码、上下文并行和图执行不属于此接入范围，设备验收尚待执行。
 
 发布分支的 `SparseFlashAttentionVllm` 保留 `torch.ops._C_ascend.npu_sparse_flash_attention` 入口，本适配使用该分支已有的 SFA。普通 FlashComm1 在注意力前会还原完整 token，可沿用 `enable_flashcomm1`，设备效果待复测。`enable_dsa_cp` 需要关闭。
 
@@ -71,6 +71,7 @@ ASCEND_RT_VISIBLE_DEVICES=6 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" 
   --host 127.0.0.1 --port 20003 --served-model-name glm53 \
   --tensor-parallel-size 1 --data-parallel-size 1 --seed 1024 \
   --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
+  --attention-config '{"indexer_kv_dtype":"bf16"}' \
   --enforce-eager --enable-prefix-caching --enable-chunked-prefill \
   --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
   --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
@@ -79,7 +80,7 @@ ASCEND_RT_VISIBLE_DEVICES=6 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" 
   --additional-config "$ADDITIONAL"
 ```
 
-小 prefill 调度窗口用于覆盖分块写出和远端历史读回。5 层 dummy 用于检查服务、量化层初始化及通信路径。精度验收需另用同一份真实裁层或完整 checkpoint，移除 `--load-format dummy`，将 peer 的层数与真实模型配置匹配后比较生成 ID。原日志中的 MMC、KV connector 和代理属于 PD 场景，AVSG 服务在同一个 worker 完成 prefill 和 decode。
+小 prefill 调度窗口用于覆盖分块写出和远端历史读回。5 层 dummy 用于检查服务、量化层初始化及通信路径。精度验收需另用同一份真实裁层或完整 checkpoint，移除 `--load-format dummy`，将 peer 的层数与真实模型配置匹配后比较生成 ID。
 
 ```bash
 curl --fail http://127.0.0.1:20003/v1/models
@@ -89,6 +90,116 @@ curl --fail http://127.0.0.1:20003/v1/completions \
 ```
 
 用相同请求检查两组输出，并保留每层远端 WRITE/READ 完成状态、prefix hit 计数、peer 容量和模型卡主 KV/RoPE backing storage。后者应为 0 字节，实际设备存储由 indexer 与共享暂存、选择缓冲持有。
+
+## 日志中的 PD 服务接入
+
+这个例子使用 P 卡 6、D 卡 7、peer 卡 5。先停止前面的单服务，按通信配置小节重新启动 peer，将 peer 命令的 `ASCEND_RT_VISIBLE_DEVICES` 改为 `5`；endpoint 中的 model engine 和通信资源现在属于 D 卡。P 不启用 AVSG，D 关闭 `sparse_kv_offload_config`。P/D 的主 KV/RoPE 均为 BF16，indexer 均显式设置为 `bf16`，即先关闭 LI C8。仅设置旧日志的 `enable_sparse_li_c8=false` 不能替代本分支的 `attention_config.indexer_kv_dtype`。
+
+P/D 使用本分支相同提交，层数与缓存 dtype 必须匹配。AVSG 会拒绝缺少 dtype 元数据的旧 producer，避免将同字节数的 FP16 误读为 BF16。D 用一页固定大小的主 KV 暂存接收 P 数据，再由模型线程分批写入 peer；该页已计入内存预算。远端写入和本地 indexer 接收完成后才回复 `READ_DONE`，允许 P 复用源页；请求取消也会等待在途传输结束再释放目的页。
+
+P→D 需要现场版本的 `memfabric_hybrid` 及其 `device_urma` 支持，D→peer 需要前面编译的 HIXL/URMA 扩展。两条传输路径的依赖均需安装。保留日志中与现场库匹配的 `MEMFABRIC_HYBRID_EXTEND_LIB_PATH`、`LD_LIBRARY_PATH`；本 connector 直接创建 MemFabric TransferEngine，不从 `MMC_LOCAL_CONFIG_PATH` 读取 KV pool 配置。跨机时将下面 HTTP、proxy 和通信地址替换为双方可访问的地址，proxy 的 `--host` 还用于 D 回调 metaserver，不能填不可路由的地址。
+
+每个服务在独立终端从仓库根目录启动。以下 P/D 配置文件可先在同一终端生成：
+
+```bash
+MODEL_PATH=/mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916
+RUN_DIR=/shared/glm53-avsg/run-001
+cat > "$RUN_DIR/p-kv.json" <<'JSON'
+{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+    "connectors": [{
+      "kv_connector": "SfaRemoteD2HConnector",
+      "kv_role": "kv_producer",
+      "kv_buffer_device": "npu",
+      "kv_parallel_size": 1,
+      "kv_port": 20050,
+      "kv_connector_extra_config": {
+        "transfer_backend": "memfabric",
+        "memfabric_transfer_protocol": "device_urma",
+        "use_layerwise": true
+      }
+    }]
+  }
+}
+JSON
+cat > "$RUN_DIR/d-kv.json" <<'JSON'
+{
+  "kv_connector": "SfaRemoteD2HConnector",
+  "kv_role": "kv_consumer",
+  "kv_port": 20050,
+  "kv_connector_extra_config": {
+    "transfer_backend": "memfabric",
+    "memfabric_transfer_protocol": "device_urma",
+    "use_layerwise": true
+  }
+}
+JSON
+jq -n --arg endpoint "$RUN_DIR/endpoint-0.json" \
+  '{avsg_config: {endpoint_file: $endpoint}, sparse_kv_offload_config: {enabled: false},
+    enable_dsa_cp: false, enable_flashcomm1: true}' > "$RUN_DIR/d-additional.json"
+```
+
+P 使用普通本地 KV；启用 prefix caching，后面的 ais-bench 统计 P 的命中率：
+
+```bash
+MODEL_PATH=/mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916
+RUN_DIR=/shared/glm53-avsg/run-001
+ASCEND_RT_VISIBLE_DEVICES=6 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" \
+  --host 127.0.0.1 --port 20002 --served-model-name glm53 \
+  --tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 1 \
+  --seed 1024 --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
+  --attention-config '{"indexer_kv_dtype":"bf16"}' \
+  --enforce-eager --enable-prefix-caching --enable-chunked-prefill \
+  --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
+  --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
+  --trust-remote-code --load-format dummy \
+  --hf-overrides '{"num_hidden_layers":5,"use_index_cache":true}' \
+  --kv-transfer-config "$(cat "$RUN_DIR/p-kv.json")" \
+  --additional-config '{"sparse_kv_offload_config":{"enabled":false},"enable_dsa_cp":false,"enable_flashcomm1":true}'
+```
+
+D 从 P 接收 prompt 的 main KV 和 indexer，main KV 导入 peer，后续 decode 写出新 KV。此处关闭 D 的 prefix caching，让场景 warmup 和正式请求都访问 P，避免 D 缓存命中减少 P 流量后混淆 90% 目标命中率：
+
+```bash
+MODEL_PATH=/mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916
+RUN_DIR=/shared/glm53-avsg/run-001
+ASCEND_RT_VISIBLE_DEVICES=7 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" \
+  --host 127.0.0.1 --port 20003 --served-model-name glm53 \
+  --tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 1 \
+  --seed 1024 --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
+  --attention-config '{"indexer_kv_dtype":"bf16"}' \
+  --enforce-eager --no-enable-prefix-caching --enable-chunked-prefill \
+  --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
+  --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
+  --trust-remote-code --load-format dummy \
+  --hf-overrides '{"num_hidden_layers":5,"use_index_cache":true}' \
+  --kv-transfer-config "$(cat "$RUN_DIR/d-kv.json")" \
+  --additional-config "$(cat "$RUN_DIR/d-additional.json")"
+```
+
+P/D 就绪后启动日志同款 layerwise proxy：
+
+```bash
+python3 examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py \
+  --host 127.0.0.1 --port 20004 \
+  --prefiller-hosts 127.0.0.1 --prefiller-ports 20002 \
+  --decoder-hosts 127.0.0.1 --decoder-ports 20003
+```
+
+该 proxy 支持 `/v1/completions`、`/v1/chat/completions`、`/healthcheck` 和 `POST /reset_prefix_cache`；reset 转发所有 P/D，任一失败返回 500。它没有 `/metrics`。以下完成请求必须同时观察 P 的逐层发送、D 的接收和 peer 写入完成，不能只用 HTTP 200 验收：
+
+```bash
+curl --fail http://127.0.0.1:20004/healthcheck
+curl --fail -X POST http://127.0.0.1:20004/reset_prefix_cache
+curl --fail http://127.0.0.1:20002/metrics
+curl --fail http://127.0.0.1:20004/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm53","prompt":"The first three prime numbers are","seed":1024,"temperature":0,"max_tokens":32,"ignore_eos":true,"return_token_ids":true}'
+```
+
+需要验证 D 的 prefix 复用时，单独改成 `--enable-prefix-caching`，记录两端各自的 prefix hit/query 计数和 D 远端请求数量；这与下面专门统计 P 命中的性能口径分开。5 层 dummy 只检查功能，不作模型精度或完整模型性能结论。
 
 ## ais-bench 性能配置
 
@@ -111,8 +222,26 @@ ais-bench-prefix-cache run --scenario /shared/glm53-avsg/local-smoke.json \
 
 AVSG 组使用相同命令，改用独立的 `avsg-smoke` 输出路径，并核对生成数据的 SHA256、分词长度、请求顺序与本地组一致。每组从新启动且无历史请求的服务开始，先完成场景自身的 warmup，再统计正式请求。配置写入 `--mode perf`，汇总器使用 `DefaultPerfSummarizer`，采集实际输入/输出 token、前缀命中率、TTFT、TPOT、吞吐与失败率。报告中同时记录模型为 dummy 或真实权重、TP、HBM 用量和数据规模。[AISBench 性能模式](https://github.com/AISBench/benchmark/blob/master/docs/source_en/base_tutorials/scenes_intro/performance_benchmark.md)
 
-128k 组将场景改成 `--profile 128k`，两种服务都将 `--max-model-len` 设为至少 131104，可使用 131200。为容纳 16 个各长 131200 的请求，可将两组的 `--num-gpu-blocks-override` 和 peer `blocks` 均设为 16400，先核算本地参考组和 peer 的实际 HBM。5 层 BF16 主 KV/RoPE 在该布局约占 11.26 GiB。可按目标并发下调 `--max-num-seqs` 与页数，保证相同负载与相同容量约束。性能组的 `--max-num-batched-tokens` 可恢复为日志的 8192，两种路径保持一致。
+PD 使用同一份负载，分别设置推理、P 指标和全体缓存 reset 的 origin。origin 参数只接受协议、地址和端口，不附带 `/metrics` 等路径。未指定时 metrics/reset 沿用 `--service-url`，单服务命令不变。
+
+```bash
+python3 examples/avsg/glm53_scenario.py \
+  --model /mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916 \
+  --corpus /code/benchmark/ais_bench/datasets/gsm8k/test.jsonl \
+  --service-url http://127.0.0.1:20004 \
+  --metrics-origin http://127.0.0.1:20002 --reset-origin http://127.0.0.1:20004 \
+  --profile smoke --output-dir /shared/glm53-avsg/pd-smoke \
+  --scenario /shared/glm53-avsg/pd-smoke.json
+ais-bench-prefix-cache inspect --scenario /shared/glm53-avsg/pd-smoke.json
+ais-bench-prefix-cache prepare --mode text --scenario /shared/glm53-avsg/pd-smoke.json
+ais-bench-prefix-cache run --scenario /shared/glm53-avsg/pd-smoke.json \
+  --config "$PWD/examples/avsg/prefix_cache_perf.py"
+```
+
+场景 warmup 和正式推理均通过 20004 proxy；缓存 reset 经 proxy 清除 P/D，命中率从 20002 的 P 指标采集。按上面的 D 无 prefix 配置，正式请求会回到 P 复用 warmup 的前缀。核对 P `vllm:prefix_cache_queries` 与 `vllm:prefix_cache_hits` 的正式请求增量后再报告实际命中率，不能用 D 指标或目标值 90% 代替实测值。`ais_bench_prefix_cache` 的现场版本仍需确认其 warmup/reset 顺序及 Prometheus 指标兼容性；本地只验证生成的配置和 URL 路由。
+
+128k 组将场景改成 `--profile 128k`。单服务和 PD 的 **P、D 两端**都将 `--max-model-len` 设为至少 131104，可使用 131200，不能沿用原日志的 8192/13500。为容纳 16 个各长 131200 的请求，可将服务的 `--num-gpu-blocks-override` 和 peer `blocks` 均设为 16400，先核算 P/本地参考组和 peer 的实际 HBM。5 层 BF16 主 KV/RoPE 在该布局约占 11.26 GiB。可按目标并发下调 `--max-num-seqs` 与页数，保证相同负载与相同容量约束。性能组的 `--max-num-batched-tokens` 可恢复为日志的 8192，两种路径保持一致。
 
 上述页数按调度页与算子页均为 128 token 计算。如果运行时调度器合并为更大的页，peer 所需页数应乘以 `scheduler_block_size / 128`。worker 会按该比例检查配置，同时计入本地 indexer 的容量。
 
-本机仅验证配置生成、Python 语法和调用参数。`ais_bench_prefix_cache` 的端到端生成、模型加载、远端通信、精度和性能由后续服务器验证提供结果。
+本机验证配置生成、独立 metrics/reset origin、CLI 参数和 Python 语法。`ais_bench_prefix_cache` 的端到端生成、P/D 模型加载、MemFabric/HIXL 通信、精度和性能由后续服务器验证提供结果。

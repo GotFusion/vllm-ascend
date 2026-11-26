@@ -37,15 +37,20 @@ def cache_specs(request):
 
 
 @pytest.mark.parametrize(("indexer_budget_blocks", "peer_pages", "limit"), [(9, 7, 3), (2, 9, 2)])
+@pytest.mark.parametrize("pd", [False, True])
 def test_worker_sizes_logical_pool_and_guards_overrides(
-    monkeypatch, cache_specs, indexer_budget_blocks, peer_pages, limit
+    monkeypatch, cache_specs, indexer_budget_blocks, peer_pages, limit, pd
 ):
     specs, group = cache_specs
     cache_config = SimpleNamespace(
         num_gpu_blocks_override=None, get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC
     )
     worker = SimpleNamespace(
-        vllm_config=SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None), cache_config=cache_config),
+        vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(hisparse_config=None),
+            cache_config=cache_config,
+            kv_transfer_config=SimpleNamespace() if pd else None,
+        ),
         cache_config=cache_config,
         _avsg_endpoint_file="peer.json",
         avsg_transport=SimpleNamespace(remote_block_capacity=peer_pages, block_size=128),
@@ -53,6 +58,10 @@ def test_worker_sizes_logical_pool_and_guards_overrides(
     )
     monkeypatch.setattr(worker_module, "get_kv_cache_groups", lambda *_: [group])
     device_bytes = indexer_budget_blocks * specs["indexer.0"].page_size_bytes
+    if pd:
+        # One page of main KV plus int64 row offsets/destination slots is
+        # allocated at connector registration, after memory profiling.
+        device_bytes += specs["main.0"].page_size_bytes + 2 * specs["main.0"].block_size * torch.int64.itemsize
     scale = worker_module.NPUWorker._scale_kv_cache_memory_for_multi_group
     assert scale(worker, device_bytes) == limit * sum(spec.page_size_bytes for spec in specs.values())
     cache_config.num_gpu_blocks_override = limit + 1

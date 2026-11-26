@@ -11,8 +11,8 @@ OUTPUT_TOKENS = 32
 PROFILE_INPUT_TOKENS = {"smoke": 4096, "128k": 131072}
 
 
-def make_scenario(model_path: str, corpus_path: str, service_url: str, profile: str, output_dir: Path) -> dict:
-    parsed = urlparse(service_url)
+def normalize_origin(origin: str, name: str) -> str:
+    parsed = urlparse(origin)
     if (
         parsed.scheme not in ("http", "https")
         or not parsed.netloc
@@ -20,8 +20,23 @@ def make_scenario(model_path: str, corpus_path: str, service_url: str, profile: 
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("service_url must be an HTTP(S) origin, for example http://127.0.0.1:20003")
-    service_url = service_url.rstrip("/")
+        raise ValueError(f"{name} must be an HTTP(S) origin, for example http://127.0.0.1:20003")
+    return origin.rstrip("/")
+
+
+def make_scenario(
+    model_path: str,
+    corpus_path: str,
+    service_url: str,
+    profile: str,
+    output_dir: Path,
+    *,
+    metrics_origin: str | None = None,
+    reset_origin: str | None = None,
+) -> dict:
+    service_url = normalize_origin(service_url, "service_url")
+    metrics_origin = normalize_origin(metrics_origin if metrics_origin is not None else service_url, "metrics_origin")
+    reset_origin = normalize_origin(reset_origin if reset_origin is not None else service_url, "reset_origin")
     input_tokens = PROFILE_INPUT_TOKENS[profile]
     return {
         "schema_version": "1.0",
@@ -49,8 +64,8 @@ def make_scenario(model_path: str, corpus_path: str, service_url: str, profile: 
         },
         "service": {
             "inference_url": service_url + "/v1/completions",
-            "metrics_url": service_url + "/metrics",
-            "reset_url": service_url + "/reset_prefix_cache",
+            "metrics_url": metrics_origin + "/metrics",
+            "reset_url": reset_origin + "/reset_prefix_cache",
             "model": "glm53",
             "dp_size": 1,
             "assume_empty_cache": False,
@@ -89,12 +104,22 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Tokenizer directory for the tested GLM-5.3 checkpoint")
     parser.add_argument("--corpus", required=True, help="GSM8K test.jsonl, as in the supplied validation log")
     parser.add_argument("--service-url", default="http://127.0.0.1:20003")
+    parser.add_argument("--metrics-origin", help="HTTP(S) origin for prefix metrics; use the P server for PD")
+    parser.add_argument("--reset-origin", help="HTTP(S) origin for cache reset; the layerwise PD proxy resets P and D")
     parser.add_argument("--profile", choices=PROFILE_INPUT_TOKENS, default="smoke")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--scenario", required=True, type=Path)
     args = parser.parse_args()
     try:
-        scenario = make_scenario(args.model, args.corpus, args.service_url, args.profile, args.output_dir)
+        scenario = make_scenario(
+            args.model,
+            args.corpus,
+            args.service_url,
+            args.profile,
+            args.output_dir,
+            metrics_origin=args.metrics_origin,
+            reset_origin=args.reset_origin,
+        )
     except ValueError as error:
         parser.error(str(error))
     args.scenario.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,7 @@ import zmq
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.avsg_ingress import AvsgPDIngress
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextDescriptor,
     DSparkContextReceiver,
@@ -52,12 +53,13 @@ class ConsumerReadState:
     layer_metadata: dict[str, Any]
     main_name_to_idx: dict[str, int]
     cpu_pools: list[tuple[Any, Any] | None]
-    main_gva_bases: list[tuple[int, int]]
+    main_gva_bases: list[tuple[int | None, int | None]]
     main_block_lens: list[tuple[int, int]]
     indexer_tensors: list[Any | None]
     indexer_scale_tensors: list[Any | None]
     dest_blocks_by_req: dict[str, tuple[list[int], list[int]]]
     get_offload_layer_id: Callable[[str], int]
+    avsg_ingress: AvsgPDIngress | None = None
     copy_sfa_tail_by_req: dict[str, CopySfaTailDest] = field(default_factory=dict)
     topk_k_bases: list[int] = field(default_factory=list)
     topk_v_bases: list[int] = field(default_factory=list)
@@ -234,6 +236,16 @@ class MembPullReadThread(threading.Thread):
                                 )
                             if pp_size < 1 or not 0 <= pp_rank < pp_size:
                                 raise ValueError(f"invalid producer PP topology: rank={pp_rank}, size={pp_size}")
+                        if self._state.avsg_ingress is not None and (pp_rank, pp_size) != (0, 1):
+                            error = "AVSG PD currently requires Prefill PP=1"
+                            sock.send_multipart((identity, b"", encoder.encode((READ_FAILED, -1, error))))
+                            raise ValueError(error)
+                        if self._state.avsg_ingress is not None and set(p_layer_meta) != set(
+                            self._state.layer_metadata
+                        ):
+                            error = "AVSG PD requires matching Prefill and Decode layer sets"
+                            sock.send_multipart((identity, b"", encoder.encode((READ_FAILED, -1, error))))
+                            raise ValueError(error)
                         self._p_session = p_session
                         self._p_layer_meta = p_layer_meta
                         self._p_sessions[identity] = p_session
@@ -496,6 +508,8 @@ class MembPullReadThread(threading.Thread):
 
     def stop(self, timeout: float = THREAD_SHUTDOWN_TIMEOUT_SECONDS) -> None:
         self._stop_event.set()
+        if self._state.avsg_ingress is not None:
+            self._state.avsg_ingress.close()
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout=timeout)
         if self.is_alive():
@@ -590,6 +604,25 @@ class MembPullReadThread(threading.Thread):
             raise RuntimeError(
                 f"MembPull indexer scale presence mismatch for {layer_name}: P={p_has_scale}, D={d_has_scale}"
             )
+
+        if state.avsg_ingress is not None:
+            # Equal byte lengths do not imply equal values (e.g. FP16 and
+            # BF16). PD imports raw bytes, so reject mismatches before DMA.
+            expected_dtypes = ["torch.bfloat16", "torch.bfloat16"]
+            if d_indexer is not None:
+                expected_dtypes.append(str(d_indexer.dtype))
+            if scale_tensor is not None:
+                expected_dtypes.append(str(scale_tensor.dtype))
+            p_dtypes = p_meta.get("cache_dtypes")
+            if (
+                not isinstance(p_dtypes, (list, tuple))
+                or list(p_dtypes) != expected_dtypes
+                or len(p_dtypes) != len(p_base_addrs)
+            ):
+                raise RuntimeError(
+                    f"AVSG PD cache dtype mismatch for {layer_name}: "
+                    f"P={p_dtypes}, D requires {expected_dtypes}; rebuild both endpoints with dtype metadata"
+                )
 
         if scale_tensor is not None:
             if len(p_base_addrs) <= scale_pos:
@@ -799,6 +832,15 @@ class MembPullReadThread(threading.Thread):
 
         dest = self._wait_for_dest_blocks(ext_req_id, layer_name)
         all_d_main_ids, all_d_indexer_ids = dest
+        if state.avsg_ingress is not None:
+            if group_member_idx != 0 or ratio != 1:
+                raise ValueError("AVSG PD currently requires equal TP=1 on Prefill and Decode")
+            if main_start_block < 0 or indexer_start_block < 0:
+                raise ValueError("AVSG PD block offsets cannot be negative")
+            if any(block < 0 for block in (*p_main_block_ids, *p_indexer_block_ids)) or any(
+                not 0 <= block < state.num_blocks for block in (*all_d_main_ids, *all_d_indexer_ids)
+            ):
+                raise ValueError("AVSG PD source or destination block is outside its physical page table")
         # Only the group's first contributor (group_member_idx == 0) pulls main; the rest
         # skip it entirely. P broadcasts the full p_main_block_ids to every contributor, so
         # resolve/validate the main destination range only for the one that actually pulls
@@ -1047,6 +1089,10 @@ class MembPullReadThread(threading.Thread):
         if layer is None:
             raise RuntimeError(f"MembPull cannot resolve P/D layout for {layer_name}")
 
+        ingress = self._state.avsg_ingress
+        if ingress is not None and (group_member_idx != 0 or ratio != 1):
+            raise ValueError("AVSG PD currently requires equal TP=1 on Prefill and Decode")
+
         want_info = logger.isEnabledFor(logging.DEBUG)
         all_local_ptrs: list[int] = []
         all_peer_ptrs: list[int] = []
@@ -1104,6 +1150,18 @@ class MembPullReadThread(threading.Thread):
             if want_info:
                 assert read_info is not None
                 read_infos.append(read_info)
+
+        if ingress is not None:
+            for ext_req_id, p_main_ids, _, main_start, _ in read_reqs:
+                all_main_ids, _ = self._wait_for_dest_blocks(ext_req_id, layer_name)
+                main_ids = all_main_ids[main_start : main_start + len(p_main_ids)]
+                ingress.read_main(
+                    layer_name,
+                    p_session,
+                    (layer["p_k_base"], layer["p_v_base"]),
+                    p_main_ids,
+                    main_ids,
+                )
 
         if not all_local_ptrs:
             # This rank may own no main block in a small chunk and the layer may

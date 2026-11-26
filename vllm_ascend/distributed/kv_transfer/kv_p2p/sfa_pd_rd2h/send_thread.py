@@ -471,6 +471,7 @@ class MembPullSendingThread(threading.Thread):
                 "tensor_group_idx": list(meta.tensor_group_idx),
                 "main_tensor_count": meta.main_tensor_count,
                 "has_indexer": meta.has_indexer,
+                "cache_dtypes": list(meta.cache_dtypes),
             }
         dealer.send(
             encoder.encode(

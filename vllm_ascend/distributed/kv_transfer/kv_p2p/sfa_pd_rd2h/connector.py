@@ -6,7 +6,8 @@ This connector is dedicated to decode offload. On the Decode node
 (``kv_consumer``), remote Prefill exposes its KV and Decode pulls the bulk MLA
 KV directly into a CPU pinned offload pool; the indexer KV lands in HBM. The
 CPU pool and sparse resident-cache load path are owned by
-:class:`SparseKVOffloadManager`.
+:class:`SparseKVOffloadManager`. With AVSG enabled, Decode instead relays the
+main KV through one bounded ingress page to its peer HBM cache.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -79,14 +80,16 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
         # AscendConfig may not be initialized yet at connector construction
         # time; init_ascend_config is idempotent (no-op if already done).
         init_ascend_config(vllm_config)
-        decode_offload_enabled = get_ascend_config().sparse_kv_offload_config.enabled
+        ascend_config = get_ascend_config()
+        decode_offload_enabled = ascend_config.sparse_kv_offload_config.enabled
+        avsg_enabled = getattr(getattr(ascend_config, "avsg_config", None), "enabled", False)
         if self.is_producer:
-            assert not decode_offload_enabled, (
-                "SfaRemoteD2HConnector producer (P) must run with sparse_kv_offload_config.enabled=false."
+            assert not decode_offload_enabled and not avsg_enabled, (
+                "SfaRemoteD2HConnector producer (P) must expose local main KV without sparse offload or AVSG."
             )
         if self.is_consumer:
-            assert decode_offload_enabled, (
-                "SfaRemoteD2HConnector consumer (D) must run with sparse_kv_offload_config.enabled=true."
+            assert decode_offload_enabled != avsg_enabled, (
+                "SfaRemoteD2HConnector consumer (D) requires exactly one of sparse KV offload and AVSG."
             )
 
         if role == KVConnectorRole.SCHEDULER:

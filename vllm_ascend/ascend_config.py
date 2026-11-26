@@ -136,8 +136,24 @@ class AvsgConfig:
             raise ValueError("avsg_config requires persistent registered device buffers and cannot use sleep mode")
         if str(model.dtype) != "torch.bfloat16" or vc.cache_config.cache_dtype not in ("auto", "bfloat16"):
             raise ValueError("avsg_config requires BF16 main KV and RoPE caches")
-        if host_offload or vc.attention_config.hisparse_config is not None or vc.kv_transfer_config is not None:
-            raise ValueError("avsg_config needs locally produced KV and cannot share a cache with another KV backend")
+        if host_offload or vc.attention_config.hisparse_config is not None:
+            raise ValueError("avsg_config cannot share a cache with another KV backend")
+        transfer = vc.kv_transfer_config
+        if transfer is not None:
+            if (
+                getattr(transfer, "kv_connector", None) != "SfaRemoteD2HConnector"
+                or getattr(transfer, "kv_role", None) != "kv_consumer"
+            ):
+                raise ValueError("avsg_config PD requires a single SfaRemoteD2HConnector with kv_role=kv_consumer")
+            extra = transfer.kv_connector_extra_config or {}
+            if (
+                extra.get("transfer_backend", "memfabric") != "memfabric"
+                or extra.get("memfabric_transfer_protocol", "device_urma") != "device_urma"
+                or extra.get("use_layerwise", True) is not True
+            ):
+                raise ValueError("avsg_config PD requires layerwise MemFabric device_urma transfers")
+            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("avsg_config PD currently requires TP=1 and PP=1 on Prefill and Decode")
         if kvpp_size > 1:
             raise ValueError("avsg_config requires per-worker ownership of all local layers and cannot use KVPP")
         if max(parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size) > 1:

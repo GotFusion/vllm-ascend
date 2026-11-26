@@ -29,6 +29,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.avsg_ingress import AvsgPDIngress
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextDescriptor,
     DSparkContextReceiver,
@@ -143,6 +144,8 @@ class SFAPDRD2HConsumerWorker:
         self._mf_read_thread: MembPullReadThread | None = None
 
         self.offload_manager = None
+        self._avsg_ingress: AvsgPDIngress | None = None
+        self._avsg_pending_recv: set[str] = set()
         self._cpu_blocks_by_req: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
         # external_req_id -> internal_req_id, so get_finished can map the recv
@@ -227,6 +230,12 @@ class SFAPDRD2HConsumerWorker:
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
             "SfaRemoteD2HConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
         )
+        # Config is initialized by the connector before the worker is constructed.
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        if getattr(getattr(get_ascend_config(), "avsg_config", None), "enabled", False):
+            self._register_avsg_memfabric_pull(kv_caches)
+            return
         self.offload_manager = get_sparse_kv_offload_manager()
         if not hasattr(self.offload_manager, "offload_layer_names"):
             raise RuntimeError(
@@ -245,6 +254,8 @@ class SFAPDRD2HConsumerWorker:
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
+                if getattr(self, "_avsg_ingress", None) is not None:
+                    self._avsg_pending_recv.add(req_id)
                 descriptor = getattr(req, "dspark_context_descriptor", None)
                 if descriptor is not None:
                     receiver = self._dspark_context_receiver
@@ -329,7 +340,11 @@ class SFAPDRD2HConsumerWorker:
         return [status for status in gathered if status is not None]
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        ingress = getattr(self, "_avsg_ingress", None)
+        if ingress is not None:
+            ingress.drain()
         done_recving: set[str] = set()
+        local_done: set[str] = set()
         local_failed: set[str] = set()
 
         # memfabric pull mode: done comes from MembPullReadThread
@@ -371,6 +386,8 @@ class SFAPDRD2HConsumerWorker:
                     receiver.retire_ready_request(ext_id, descriptor.generation)
         if receiver is not None and failed_on_any:
             raise RuntimeError(f"DSpark remote prompt transfer failed; refusing local recomputation: {failed_on_any}")
+        if ingress is not None and failed_on_any:
+            raise RuntimeError(f"AVSG remote prompt transfer failed: {failed_on_any}")
         self._terminal_ext_ids.difference_update(finished_on_all)
 
         for ext_id in failed_on_any:
@@ -412,6 +429,13 @@ class SFAPDRD2HConsumerWorker:
             ready_to_cleanup = self._deferred_finished_req_ids - self._dspark_pending_recv
             if ready_to_cleanup:
                 self._cleanup_request_state(ready_to_cleanup)
+        elif ingress is not None:
+            self._avsg_pending_recv.difference_update(done_recving)
+            self._deferred_finished_req_ids.update(finished_req_ids or ())
+            ready_to_cleanup = self._deferred_finished_req_ids - self._avsg_pending_recv
+            if ready_to_cleanup:
+                self._cleanup_request_state(ready_to_cleanup)
+                self._deferred_finished_req_ids.difference_update(ready_to_cleanup)
         elif finished_req_ids:
             self._cleanup_request_state(finished_req_ids)
 
@@ -430,7 +454,8 @@ class SFAPDRD2HConsumerWorker:
         return result or None
 
     def _build_consumer_read_state(self) -> ConsumerReadState:
-        assert self.offload_manager is not None
+        ingress = getattr(self, "_avsg_ingress", None)
+        assert self.offload_manager is not None or ingress is not None
         return ConsumerReadState(
             num_blocks=self.kv_cache_config.num_blocks,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
@@ -442,7 +467,12 @@ class SFAPDRD2HConsumerWorker:
             indexer_tensors=self._indexer_tensors,
             indexer_scale_tensors=self._indexer_scale_tensors,
             dest_blocks_by_req=self._dest_blocks_by_req,
-            get_offload_layer_id=self.offload_manager._get_offload_layer_id,
+            get_offload_layer_id=(
+                self._main_name_to_idx.__getitem__
+                if ingress is not None
+                else self.offload_manager._get_offload_layer_id
+            ),
+            avsg_ingress=ingress,
             copy_sfa_tail_by_req=self._copy_sfa_tail_by_req,
             topk_k_bases=self._topk_k_bases,
             topk_v_bases=self._topk_v_bases,
@@ -452,6 +482,52 @@ class SFAPDRD2HConsumerWorker:
             dspark_draft_kv_metadata=self.dspark_draft_kv_metadata,
             dspark_draft_blocks_by_req=self._dspark_draft_blocks_by_req,
         )
+
+    def _register_avsg_memfabric_pull(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Keep indexer resident; use scheduler main page IDs on the AVSG peer."""
+        if self.tp_size != 1 or self.vllm_config.parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("AVSG PD currently requires Decode TP=1 and PP=1")
+        assert self.kv_cache_config is not None
+        num_blocks = self.kv_cache_config.num_blocks
+        main_group, indexer_group = infer_sfa_component_group_ids(self.kv_cache_config)
+        block_tokens = self.kv_cache_config.kv_cache_groups[main_group].kv_cache_spec.block_size
+        main_names = sorted((name for name in kv_caches if "indexer" not in name.lower()), key=_layer_idx)
+        contexts = self.vllm_config.compilation_config.static_forward_context
+        layers = {}
+        for name in main_names:
+            impl = getattr(contexts.get(name), "impl", None)
+            if impl is None or not hasattr(impl, "avsg_transport"):
+                raise RuntimeError(f"AVSG PD layer {name} has no initialized worker transport")
+            layers[name] = (impl.avsg_layer_id, impl.avsg_transport)
+        self._ensure_engine()
+        self._avsg_ingress = AvsgPDIngress(self.engine, layers, block_tokens, num_blocks)
+        self._main_names = main_names
+        self._main_name_to_idx = {name: idx for idx, name in enumerate(main_names)}
+        self._main_gva_bases = [(None, None)] * len(main_names)
+        self._main_block_lens = [self._avsg_ingress.block_bytes] * len(main_names)
+        self._cpu_pools = [None] * len(main_names)
+        self._indexer_tensors = []
+        self._indexer_scale_tensors = []
+        indexer_by_layer = {_layer_idx(name): name for name in kv_caches if "indexer" in name.lower()}
+        for name in main_names:
+            indexer_name = indexer_by_layer.get(_layer_idx(name))
+            caches = () if indexer_name is None else kv_caches[indexer_name]
+            if not isinstance(caches, (list, tuple)):
+                caches = (caches,)
+            self._indexer_tensors.append(caches[0] if caches else None)
+            self._indexer_scale_tensors.append(caches[1] if len(caches) > 1 else None)
+            if len(caches) > 2 or any(t.shape[0] % num_blocks for t in caches):
+                raise ValueError(f"AVSG PD indexer cache has invalid external page geometry: {name}")
+            self.layer_metadata[name] = LayerMetadata(
+                tensor_group_idx=[indexer_group] * len(caches),
+                kv_caches_base_addr=[t.data_ptr() for t in caches],
+                block_len=[t.element_size() * math.prod(t.shape[1:]) for t in caches],
+                block_size_scale=[t.shape[0] // num_blocks for t in caches],
+                main_tensor_count=0,
+                has_indexer=bool(caches),
+            )
+        self._start_memfabric_read_thread()
+        logger.info("SFAPDRD2H D-side AVSG ingress: %d layers, %d tokens of main-KV staging", len(layers), block_tokens)
 
     def _register_memfabric_pull(
         self,
@@ -540,6 +616,14 @@ class SFAPDRD2HConsumerWorker:
         # Create memfabric engine (no registration)
         self._ensure_engine()
         self._bind_copy_sfa_tail_destinations()
+        self._start_memfabric_read_thread()
+        logger.info(
+            "SFAPDRD2H D-side registered (memfabric pull): %d indexer + %d TP-shared main layers",
+            sum(t is not None for t in self._indexer_tensors),
+            len(main_names),
+        )
+
+    def _start_memfabric_read_thread(self) -> None:
         read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
@@ -556,11 +640,6 @@ class SFAPDRD2HConsumerWorker:
             error = self._mf_read_thread.startup_error
             self._mf_read_thread.stop()
             raise RuntimeError("SFAPD D-side read thread failed during startup") from error
-        logger.info(
-            "SFAPDRD2H D-side registered (memfabric pull): %d indexer + %d TP-shared main layers",
-            sum(t is not None for t in self._indexer_tensors),
-            len(main_names),
-        )
 
     def _bind_copy_sfa_tail_destinations(self) -> None:
         """Publish rank-local topk buffer bases for circular-tail D2D."""
@@ -590,6 +669,9 @@ class SFAPDRD2HConsumerWorker:
             )
 
     def shutdown(self) -> None:
+        ingress = getattr(self, "_avsg_ingress", None)
+        if ingress is not None:
+            ingress.close()
         read_thread = getattr(self, "_mf_read_thread", None)
         if read_thread is not None:
             read_thread.stop()
@@ -818,6 +900,7 @@ class SFAPDRD2HProducerWorker:
                 layer_meta.kv_caches_base_addr.append(single_kv_cache.data_ptr())
                 layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape[1:]))
                 layer_meta.block_size_scale.append(tensor_num_blocks // num_blocks)
+                layer_meta.cache_dtypes.append(str(single_kv_cache.dtype))
 
         for physical_idx, main_name in sorted(main_by_layer.items()):
             layer_meta = LayerMetadata([], [], [], [])

@@ -32,7 +32,7 @@ LLM(model="Qwen/Qwen3-8B", additional_config={"config_key":"config_value"})
 
 ### Configuration options
 
-AVSG eager stores main KV/RoPE in a peer NPU selected through a per-rank endpoint and manifest. Set the typed `avsg_config.endpoint_file` below to enable this transport. The existing sparse KV offload settings address host memory. See the [GLM-5.3 AVSG guide](../feature_guide/avsg_remote_kv.md) for peer setup and compatible serving options.
+AVSG eager stores main KV/RoPE in a peer NPU selected through a per-rank endpoint and manifest. Set the typed `avsg_config.endpoint_file` below to enable this transport. PD deployments use `SfaRemoteD2HConnector` on Decode with layerwise MemFabric `device_urma` transfers and TP=1/PP=1 on both sides; Prefill uses its regular local KV cache. The existing sparse KV offload settings address host memory and must stay disabled with AVSG. See the [GLM-5.3 AVSG guide](../feature_guide/avsg_remote_kv.md) for peer setup and compatible serving options.
 
 The following table lists additional configuration options available in vLLM Ascend:
 

@@ -158,6 +158,36 @@ class AvsgTransport:
             staging.flatten(0, 1).index_copy_(0, local, cache[blocks, offsets])
         self.publish_staged(layer_id, slots)
 
+    def publish_received(self, layer_id: int, kv: torch.Tensor, rope: torch.Tensor, slots: torch.Tensor) -> None:
+        """Import a PD ingress page on the model thread before acknowledging its producer.
+
+        The connector owns the bounded ingress tensors. The source page can be
+        larger than a Decode step (e.g. 128 rows versus 60 scheduled tokens), so
+        reuse the registered WRITE source in checked, synchronous chunks.
+        """
+        if self._closed:
+            raise RuntimeError("AVSG transport is closed")
+        if layer_id not in self._writes:
+            raise ValueError(f"AVSG peer has no layer {layer_id}")
+        if (
+            slots.ndim != 1
+            or slots.dtype not in (torch.int32, torch.int64)
+            or kv.shape != (slots.numel(), self._source_kv.shape[-1])
+            or rope.shape != (slots.numel(), self._source_rope.shape[-1])
+            or any(t.dtype != self._source_kv.dtype or t.device != self._source_kv.device for t in (kv, rope))
+            or slots.device != self._source_kv.device
+        ):
+            raise ValueError("AVSG PD ingress requires matching KV/RoPE rows and integer slots on the worker device")
+        # PD is an admission path, outside attention's hot loop. Validate before
+        # publishing any rows, rather than allowing a partial invalid transfer.
+        if torch.any((slots < 0) | (slots >= self._remote_blocks[layer_id] * self._block_size)):
+            raise ValueError("AVSG PD destination slots exceed the peer cache")
+        for start in range(0, slots.numel(), self._max_tokens):
+            end = min(start + self._max_tokens, slots.numel())
+            self._source_kv.flatten(0, 1)[: end - start].copy_(kv[start:end])
+            self._source_rope.flatten(0, 1)[: end - start].copy_(rope[start:end])
+            self.publish_staged(layer_id, slots[start:end])
+
     def gather(
         self, layer_id: int, q_lens: torch.Tensor, mapping: torch.Tensor, counts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

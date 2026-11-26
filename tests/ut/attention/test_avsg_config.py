@@ -21,7 +21,12 @@ def _glm_config():
             enable_sleep_mode=False,
         ),
         parallel_config=SimpleNamespace(
-            world_size=2, data_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
+            world_size=2,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
         ),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         attention_config=SimpleNamespace(hisparse_config=None),
@@ -76,7 +81,7 @@ def test_avsg_rejects_kv_layer_parallelism():
     "field,value,reason",
     [
         ("use_v2_model_runner", False, "V2_MODEL_RUNNER"),
-        ("kv_transfer_config", SimpleNamespace(), "another KV backend"),
+        ("kv_transfer_config", SimpleNamespace(), "SfaRemoteD2HConnector"),
         ("speculative_config", SimpleNamespace(), "speculation"),
         ("additional_config", {"enable_dsa_cp": True}, "enable_dsa_cp"),
     ],
@@ -101,3 +106,43 @@ def test_avsg_rejects_host_cache_offload():
         pytest.raises(ValueError, match="another KV backend"),
     ):
         AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(_glm_config(), True)
+
+
+def _pd_config():
+    vc = _glm_config()
+    vc.kv_transfer_config = SimpleNamespace(
+        kv_connector="SfaRemoteD2HConnector", kv_role="kv_consumer", kv_connector_extra_config={}
+    )
+    return vc
+
+
+def test_avsg_accepts_pd_consumer_without_host_offload():
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True):
+        AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(_pd_config(), False)
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("kv_connector", "MultiConnector", "single SfaRemoteD2HConnector"),
+        ("kv_role", "kv_producer", "kv_consumer"),
+        ("kv_role", "kv_both", "kv_consumer"),
+        ("kv_connector_extra_config", {"transfer_backend": "mooncake"}, "MemFabric"),
+        ("kv_connector_extra_config", {"memfabric_transfer_protocol": "sdma"}, "device_urma"),
+        ("kv_connector_extra_config", {"use_layerwise": False}, "layerwise"),
+        ("kv_connector_extra_config", {"use_layerwise": "true"}, "layerwise"),
+    ],
+)
+def test_avsg_rejects_unsupported_pd_transfer(field, value, reason):
+    vc = _pd_config()
+    setattr(vc.kv_transfer_config, field, value)
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True), pytest.raises(ValueError, match=reason):
+        AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(vc, False)
+
+
+@pytest.mark.parametrize("field", ["tensor_parallel_size", "pipeline_parallel_size"])
+def test_avsg_pd_requires_single_rank(field):
+    vc = _pd_config()
+    setattr(vc.parallel_config, field, 2)
+    with patch("vllm_ascend.ascend_config.is_950", return_value=True), pytest.raises(ValueError, match="TP=1 and PP=1"):
+        AvsgConfig(endpoint_file="/endpoints/{rank}.json").validate(vc, False)

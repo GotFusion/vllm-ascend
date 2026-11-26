@@ -247,6 +247,13 @@ class SFAPDRD2HScheduler:
             raise ValueError("SFAPDRD2HScheduler requires KVCacheConfig")
         self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config)
+        main_group = kv_cache_config.kv_cache_groups[self.main_group_idx]
+        main_specs = getattr(main_group.kv_cache_spec, "kv_cache_specs", {})
+        self._main_store_on_peer = any(
+            getattr(main_specs.get(name, main_group.kv_cache_spec), "store_on_peer", False)
+            for name in main_group.layer_names
+            if "indexer" not in name.lower()
+        )
         self._dspark_context_groups = self._find_dspark_context_groups()
         self._dspark_context_requests: dict[str, tuple[DSparkContextDescriptor, dict[int, tuple[int, ...]]]] = {}
 
@@ -295,6 +302,7 @@ class SFAPDRD2HScheduler:
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
         self._dspark_pending_recv: set[str] = set()
+        self._avsg_pending_recv: set[str] = set()
         self._deferred_finished_req_ids: set[str] = set()
         self.executor = ThreadPoolExecutor(32)
         self._metaserver_futures = {}
@@ -360,6 +368,24 @@ class SFAPDRD2HScheduler:
         if params is None or not params.get("do_remote_prefill"):
             return
 
+        remote_cached_tokens = request.num_computed_tokens
+        if getattr(self, "_main_store_on_peer", False):
+            prompt_tokens = len(request.prompt_token_ids)
+            if not 0 <= num_external_tokens <= prompt_tokens:
+                raise ValueError("SFA PD external tokens must fit within the prompt")
+            if num_external_tokens == 0:
+                # The scheduler kept its local hit (including a possible
+                # partial tail); it will not wait for an asynchronous receive.
+                params["do_remote_prefill"] = False
+                return
+            # vLLM calls this hook before assigning the admission's local hit
+            # to request.num_computed_tokens. Our external hit covers the rest
+            # of the prompt, so recover the exact accepted prefix from it.
+            # Do not overwrite peer pages already shared by another request.
+            remote_cached_tokens = prompt_tokens - num_external_tokens
+            # Keep the host Copy-SFA path's existing behavior: a new dense
+            # top-k row still needs its cached prefix copied into that row.
+
         block_ids_by_group = SFAPDRD2HProducerScheduler._normalize_block_ids(blocks.get_block_ids())
         required_group = max(self.main_group_idx, self.indexer_group_idx)
         if len(block_ids_by_group) <= required_group:
@@ -370,6 +396,8 @@ class SFAPDRD2HScheduler:
         main_block_ids = list(block_ids_by_group[self.main_group_idx])
         indexer_block_ids = list(block_ids_by_group[self.indexer_group_idx])
         self._request_trackers[request.request_id] = (main_block_ids, indexer_block_ids)
+        if getattr(self, "_main_store_on_peer", False):
+            self._avsg_pending_recv.add(request.request_id)
         dspark_context_descriptor = None
         dspark_draft_block_ids_by_group = None
         if getattr(self, "_dspark_context_groups", ()):
@@ -429,7 +457,7 @@ class SFAPDRD2HScheduler:
             remote_tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_pcp_size=self.vllm_config.parallel_config.prefill_context_parallel_size,
             remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
-            remote_cached_tokens=request.num_computed_tokens,
+            remote_cached_tokens=remote_cached_tokens,
         )
         if dspark_context_descriptor is not None:
             kv_transfer_params["dspark_context_generation"] = dspark_context_descriptor.generation
@@ -503,9 +531,13 @@ class SFAPDRD2HScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        if request.request_id in self._dspark_pending_recv:
+        if request.request_id in self._dspark_pending_recv or request.request_id in getattr(
+            self, "_avsg_pending_recv", ()
+        ):
             # Let the existing rendezvous and reads drain naturally. vLLM
-            # retains the KV blocks; retain the connector's destinations too.
+            # retains the KV blocks; retain the connector's destinations and
+            # rendezvous too. Cancelling a not-yet-dispatched P request would
+            # leave those blocks waiting forever for a completion signal.
             self._deferred_finished_req_ids.add(request.request_id)
             return True, None
         self._cleanup_finished_request(request.request_id)
@@ -514,6 +546,7 @@ class SFAPDRD2HScheduler:
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         completed = set(connector_output.finished_recving or ())
         self._dspark_pending_recv.difference_update(completed)
+        getattr(self, "_avsg_pending_recv", set()).difference_update(completed)
         for request_id in completed & self._deferred_finished_req_ids:
             self._cleanup_finished_request(request_id)
 
@@ -523,6 +556,7 @@ class SFAPDRD2HScheduler:
         getattr(self, "_dspark_context_requests", {}).pop(request_id, None)
         self._reqs_need_recv.discard(request_id)
         self._dspark_pending_recv.discard(request_id)
+        getattr(self, "_avsg_pending_recv", set()).discard(request_id)
         self._deferred_finished_req_ids.discard(request_id)
         copy_sfa_bindings = getattr(self, "_copy_sfa_bindings", None)
         if copy_sfa_bindings is not None:

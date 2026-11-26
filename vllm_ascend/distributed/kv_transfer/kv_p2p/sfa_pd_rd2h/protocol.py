@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -79,6 +79,9 @@ class LayerMetadata:
     # indices and therefore do not own an indexer cache at all.
     main_tensor_count: int = 2
     has_indexer: bool = False
+    # Component dtypes travel with MF_META. AVSG validates them before import;
+    # host offload retains compatibility with producers predating this field.
+    cache_dtypes: list[str] = field(default_factory=list)
 
 
 @dataclass

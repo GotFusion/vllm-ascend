@@ -219,3 +219,51 @@ def test_failed_transfer_is_reported(transport, direction):
     peer.session.close.assert_called_once()
     with pytest.raises(RuntimeError, match="closed"):
         adapter.publish(0, kv, rope, torch.tensor([2]))
+
+
+def test_pd_page_larger_than_decode_batch_preserves_prefix_and_layers(transport):
+    adapter, peer = transport
+    source_kv, source_rope = paged_cache()
+    # A previously cached prefix belongs to page 0; import a new suffix into
+    # page 1 using many small WRITE batches (the serving capacity is four).
+    adapter.publish(0, source_kv, source_rope, torch.tensor([1, 2]))
+    kv, rope = source_kv.flatten(0, 2)[128:], source_rope.flatten(0, 2)[128:]
+    slots = torch.arange(255, 127, -1)
+    for layer, sign in ((0, 1), (3, -1)):
+        adapter.publish_received(layer, sign * kv, sign * rope, slots)
+        received_kv, received_rope = peer.rows[(layer + 1) * 8192]
+        torch.testing.assert_close(received_kv[slots], (sign * kv).float())
+        torch.testing.assert_close(received_rope[slots], (sign * rope).float())
+    torch.testing.assert_close(peer.rows[8192][0][[1, 2]], source_kv.flatten(0, 2)[[1, 2]].float())
+    assert peer.session.check_graph_copy.call_count == 65
+
+
+@pytest.mark.parametrize("bad_slot", [-1, 256, 2**32])
+def test_pd_validates_entire_page_before_first_write(transport, bad_slot):
+    adapter, peer = transport
+    kv, rope = paged_cache()
+    with pytest.raises(ValueError, match="destination slots"):
+        adapter.publish_received(0, kv.flatten(0, 2)[:5], rope.flatten(0, 2)[:5], torch.tensor([1, 2, 3, 4, bad_slot]))
+    peer.session.check_graph_copy.assert_not_called()
+
+
+def test_pd_write_failure_stops_page_and_poison_transport(transport):
+    adapter, peer = transport
+    kv, rope = paged_cache()
+    peer.failure = "write"
+    with pytest.raises(RuntimeError, match="failed transfer"):
+        adapter.publish_received(0, kv.flatten(0, 2)[:8], rope.flatten(0, 2)[:8], torch.arange(8))
+    peer.session.check_graph_copy.assert_called_once()
+    peer.session.close.assert_called_once()
+    with pytest.raises(RuntimeError, match="closed"):
+        adapter.publish_received(0, kv.flatten(0, 2)[:8], rope.flatten(0, 2)[:8], torch.arange(8))
+
+
+def test_pd_rejects_layout_mismatch(transport):
+    adapter, peer = transport
+    kv, rope = paged_cache()
+    with pytest.raises(ValueError, match="matching KV/RoPE"):
+        adapter.publish_received(0, kv.flatten(0, 2)[:8], rope.flatten(0, 2)[:7], torch.arange(8))
+    with pytest.raises(ValueError, match="no layer"):
+        adapter.publish_received(1, kv.flatten(0, 2)[:8], rope.flatten(0, 2)[:8], torch.arange(8))
+    peer.session.check_graph_copy.assert_not_called()

@@ -368,13 +368,15 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
-        if (transport := getattr(self, "avsg_transport", None)) is not None:
-            transport.close()
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        # Stop PD admission and release pending ingress waiters before closing
+        # the session that their model-thread publication would use.
+        if (transport := getattr(self, "avsg_transport", None)) is not None:
+            transport.close()
 
         if self.profiler is not None:
             self.profiler.shutdown()
@@ -688,6 +690,24 @@ class NPUWorker(WorkerBase):
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         if self._avsg_endpoint_file is not None:
             transport = self.avsg_transport
+            if getattr(self.vllm_config, "kv_transfer_config", None) is not None:
+                # PD allocates one ingress page after profiling, shared across
+                # layers. Reserve it plus its persistent offsets and temporary
+                # destination slots before sizing resident indexer storage.
+                ingress_bytes = max(
+                    (
+                        spec.page_size_bytes + 2 * spec.block_size * torch.int64.itemsize
+                        for group in kv_cache_groups
+                        for spec in (
+                            group.kv_cache_spec.kv_cache_specs.values()
+                            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                            else (group.kv_cache_spec,)
+                        )
+                        if getattr(spec, "store_on_peer", False)
+                    ),
+                    default=0,
+                )
+                available_memory = max(0, available_memory - ingress_bytes)
             block_limit = get_avsg_cache_block_limit(
                 kv_cache_groups, transport.remote_block_capacity, transport.block_size, available_memory
             )
