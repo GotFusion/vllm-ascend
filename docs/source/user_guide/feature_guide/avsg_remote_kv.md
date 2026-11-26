@@ -249,10 +249,12 @@ ais-bench-prefix-cache run --scenario /shared/glm53-avsg/pd-smoke.json \
 | 128k | 131072 | 32 | 131104 | 131200 |
 | 256k | 262144 | 32 | 262176 | 262272 |
 
-先在服务器 `/mnt/share/weight` 下确认实际 GLM-5.3 模型目录，设置 `MODEL_PATH`；不要将日志里的旧路径当成现场已存在的路径。以下一次生成三种长度的独立场景，不连接服务：
+本次 950DT 的量化源权重位于 `/mnt/weight/GLM-5.3-w4a4c8-mxfp4`，模型类型为 `glm_moe_dsa`。`/mnt/share/weight` 下的 GLM-5.3-Flash 使用 `glm5_next` 架构。三档场景使用从量化源权重提取的真实前五层，保留 embedding、生成头、量化元数据与 tokenizer。原始权重中第 0–2 层使用 dense FFN，第 3–4 层使用 MoE。裁层索引包含 3,193 个张量，已逐张量核对原始字节 SHA256。
+
+两端都用同一份裁层启动 `vllm serve "$MODEL_PATH" --load-format auto --quantization ascend`，并保留上述 PD 各自的 connector、eager、BF16 KV 和 indexer 配置。裁层本身设置 `num_hidden_layers=5`、`num_nextn_predict_layers=0`，启动时省略 speculative decoding 配置。以下生成三种长度的独立场景。
 
 ```bash
-: "${MODEL_PATH:?Set MODEL_PATH to the actual GLM-5.3 checkpoint under /mnt/share/weight}"
+MODEL_PATH=/home/w00959236/avsg-validation-results/glm53-v030-runtime/models/glm53-w4a4c8-5l
 test -f "$MODEL_PATH/config.json"
 CORPUS_PATH=/code/benchmark/ais_bench/datasets/gsm8k/test.jsonl
 RESULTS_ROOT=/shared/glm53-avsg/mtp0-lengths-run-001
@@ -266,10 +268,19 @@ for profile in 64k 128k 256k; do
 done
 ```
 
-按每个场景运行上面的 inspect/prepare/run 流程，并保留原始 AISBench 日志与 P/D metrics。先用日志中的 5 层 dummy 检查三种长度的功能，结果标明 dummy、MTP0、实际卡数和 P/D/peer 部署位置。1～2 卡的现场布局需要分别核算共卡进程的权重、P 的本地主 KV、D 的 indexer、peer 和 ingress HBM；前面的三独立卡示例不是这次卡数分配要求。
+每档在独立目录运行上述 inspect、prepare 和 run 命令，保存真实裁层模型的 P、D 加载日志、设备显存快照、AISBench 三张原始表及 P/D metrics。两张空闲卡中，P 与 peer 共用一张，D 单独使用另一张。需要核算 P 权重及本地主 KV、peer HBM、D 权重与 indexer、单页 ingress 占用。
+
+每档 warmup 后发送 5 条正式请求，batch 为 2，流式输出 32 个 token。90% 是构造输入时的前缀命中目标。实测值取正式请求期间 P 的 `vllm:prefix_cache_hits_total` 增量除以 `vllm:prefix_cache_queries_total` 增量。报告中保留 warmup、reset、指标采样边界、实际成功和重试数。
 
 启动前同时核对 checkpoint 支持的上下文长度、服务的 `--num-gpu-blocks-override` 和 peer `blocks`；256K 输入还要容纳 32 个输出 token。按实际并发和缓存组分配页数，计入调度器保留的空页，不沿用 smoke 的 1024 页。本次 PD 性能测试按参考日志保留 `--max-num-batched-tokens` **P=8192、D=60**，三种输入长度均使用这个组合，并在结果表中记录两端实际值；比较路径时保持相同负载与容量约束。
 
 上述页数按调度页与算子页均为 128 token 计算。如果运行时调度器合并为更大的页，peer 所需页数应乘以 `scheduler_block_size / 128`。worker 会按该比例检查配置，同时计入本地 indexer 的容量。
 
-本机验证配置生成、独立 metrics/reset origin、CLI 参数和 Python 语法。`ais_bench_prefix_cache` 的端到端生成、P/D 模型加载、MemFabric/HIXL 通信、精度和性能由后续服务器验证提供结果。
+在 950DT 的真实五层 smoke 中，vLLM 0.30.0 的 P、D 均完成了 20 个权重分片的加载。提交 `5bb0952e9` 使用 `device_urma` 将 4096-token prompt 的主 KV 逐层经单页 ingress 写到 peer；五层均在写完 32 页后返回 READ_DONE，实际生成 32 个 token。该结果验证了端到端功能。三档长输入的性能取自各自的正式 AISBench 输出。
+
+在 opsLearning 的本轮结果目录中，以下命令会通过 `npu-smi` 选择空闲卡；第二条命令沿用第一条实测得到的缓存组页数和布局。命令与原始日志见 [GLM-5.3 950DT 复测记录](https://github.com/GotFusion/opsLearning/tree/main/operator-libraries/vllm-ascend/glm-5-2-kv-offload/results/20261126-glm53-v030-pd-mtp0)。
+
+```bash
+bash service/launch.sh smoke repeat-smoke --peer-kernel-pages 148
+bash service/run_lengths.sh repeat-smoke repeat-perf 64k 128k 256k
+```
