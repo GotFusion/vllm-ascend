@@ -152,7 +152,7 @@ ASCEND_RT_VISIBLE_DEVICES=6 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" 
   --seed 1024 --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
   --attention-config '{"indexer_kv_dtype":"bf16"}' \
   --enforce-eager --enable-prefix-caching --enable-chunked-prefill \
-  --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
+  --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 16 \
   --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
   --trust-remote-code --load-format dummy \
   --hf-overrides '{"num_hidden_layers":5,"use_index_cache":true}' \
@@ -171,7 +171,7 @@ ASCEND_RT_VISIBLE_DEVICES=7 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" 
   --seed 1024 --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
   --attention-config '{"indexer_kv_dtype":"bf16"}' \
   --enforce-eager --no-enable-prefix-caching --enable-chunked-prefill \
-  --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
+  --max-model-len 8192 --max-num-batched-tokens 60 --max-num-seqs 16 \
   --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
   --trust-remote-code --load-format dummy \
   --hf-overrides '{"num_hidden_layers":5,"use_index_cache":true}' \
@@ -203,7 +203,7 @@ curl --fail http://127.0.0.1:20004/v1/completions \
 
 ## ais-bench 性能配置
 
-配置生成器保留原日志的 5 条请求、32-token 输出、batch size 2、流式输出和 90% 目标前缀命中率。`--profile smoke` 使用 4096-token 输入，`--profile 128k` 使用 131072-token 输入。前缀生成器需要日志所用的 `ais_bench_prefix_cache` 扩展。此扩展不随 vLLM Ascend 或 AISBench 安装，需在服务器安装已有验证环境使用的版本。安装后检查两个 CLI 与配置导入。
+配置生成器保留原日志的 5 条请求、32-token 输出、batch size 2、流式输出和 90% 目标前缀命中率。支持 `smoke`、`64k`、`128k`、`256k` 四种输入长度。此次 PD eager 测试使用 **MTP0**：P/D 均不传 `--speculative-config`，关闭推测解码；AISBench 的 `--num-warmups 0` 是性能工具的预热次数，与 MTP 无关。前缀生成器需要日志所用的 `ais_bench_prefix_cache` 扩展。此扩展不随 vLLM Ascend 或 AISBench 安装，需在服务器安装已有验证环境使用的版本。安装后检查两个 CLI 与配置导入。
 
 ```bash
 ais_bench --help
@@ -240,7 +240,35 @@ ais-bench-prefix-cache run --scenario /shared/glm53-avsg/pd-smoke.json \
 
 场景 warmup 和正式推理均通过 20004 proxy；缓存 reset 经 proxy 清除 P/D，命中率从 20002 的 P 指标采集。按上面的 D 无 prefix 配置，正式请求会回到 P 复用 warmup 的前缀。核对 P `vllm:prefix_cache_queries` 与 `vllm:prefix_cache_hits` 的正式请求增量后再报告实际命中率，不能用 D 指标或目标值 90% 代替实测值。`ais_bench_prefix_cache` 的现场版本仍需确认其 warmup/reset 顺序及 Prometheus 指标兼容性；本地只验证生成的配置和 URL 路由。
 
-128k 组将场景改成 `--profile 128k`。单服务和 PD 的 **P、D 两端**都将 `--max-model-len` 设为至少 131104，可使用 131200，不能沿用原日志的 8192/13500。为容纳 16 个各长 131200 的请求，可将服务的 `--num-gpu-blocks-override` 和 peer `blocks` 均设为 16400，先核算 P/本地参考组和 peer 的实际 HBM。5 层 BF16 主 KV/RoPE 在该布局约占 11.26 GiB。可按目标并发下调 `--max-num-seqs` 与页数，保证相同负载与相同容量约束。性能组的 `--max-num-batched-tokens` 可恢复为日志的 8192，两种路径保持一致。
+64K/128K/256K 场景的长度均为 token 数，输出固定 32 token。单服务和 PD 的 **P、D 两端**都须配置足够的 `--max-model-len`，不能沿用原日志的 8192/13500：
+
+| profile | 输入 token | 输出 token | 最小 max-model-len | 按 128 对齐的长度 |
+| --- | ---: | ---: | ---: | ---: |
+| smoke | 4096 | 32 | 4128 | 4224 |
+| 64k | 65536 | 32 | 65568 | 65664 |
+| 128k | 131072 | 32 | 131104 | 131200 |
+| 256k | 262144 | 32 | 262176 | 262272 |
+
+先在服务器 `/mnt/share/weight` 下确认实际 GLM-5.3 模型目录，设置 `MODEL_PATH`；不要将日志里的旧路径当成现场已存在的路径。以下一次生成三种长度的独立场景，不连接服务：
+
+```bash
+: "${MODEL_PATH:?Set MODEL_PATH to the actual GLM-5.3 checkpoint under /mnt/share/weight}"
+test -f "$MODEL_PATH/config.json"
+CORPUS_PATH=/code/benchmark/ais_bench/datasets/gsm8k/test.jsonl
+RESULTS_ROOT=/shared/glm53-avsg/mtp0-lengths-run-001
+for profile in 64k 128k 256k; do
+  python3 examples/avsg/glm53_scenario.py \
+    --model "$MODEL_PATH" --corpus "$CORPUS_PATH" \
+    --service-url http://127.0.0.1:20004 \
+    --metrics-origin http://127.0.0.1:20002 --reset-origin http://127.0.0.1:20004 \
+    --profile "$profile" --output-dir "$RESULTS_ROOT/$profile" \
+    --scenario "$RESULTS_ROOT/$profile.json"
+done
+```
+
+按每个场景运行上面的 inspect/prepare/run 流程，并保留原始 AISBench 日志与 P/D metrics。先用日志中的 5 层 dummy 检查三种长度的功能，结果标明 dummy、MTP0、实际卡数和 P/D/peer 部署位置。1～2 卡的现场布局需要分别核算共卡进程的权重、P 的本地主 KV、D 的 indexer、peer 和 ingress HBM；前面的三独立卡示例不是这次卡数分配要求。
+
+启动前同时核对 checkpoint 支持的上下文长度、服务的 `--num-gpu-blocks-override` 和 peer `blocks`；256K 输入还要容纳 32 个输出 token。按实际并发和缓存组分配页数，计入调度器保留的空页，不沿用 smoke 的 1024 页。本次 PD 性能测试按参考日志保留 `--max-num-batched-tokens` **P=8192、D=60**，三种输入长度均使用这个组合，并在结果表中记录两端实际值；比较路径时保持相同负载与容量约束。
 
 上述页数按调度页与算子页均为 128 token 计算。如果运行时调度器合并为更大的页，peer 所需页数应乘以 `scheduler_block_size / 128`。worker 会按该比例检查配置，同时计入本地 indexer 的容量。
 

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 BLOCK_SIZE = 128
 OUTPUT_TOKENS = 32
-PROFILE_INPUT_TOKENS = {"smoke": 4096, "128k": 131072}
+PROFILE_INPUT_TOKENS = {"smoke": 4096, "64k": 65536, "128k": 131072, "256k": 262144}
 
 
 def normalize_origin(origin: str, name: str) -> str:

@@ -14,7 +14,7 @@ scenario_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(scenario_module)
 
 
-@pytest.mark.parametrize("profile,input_tokens", [("smoke", 4096), ("128k", 131072)])
+@pytest.mark.parametrize("profile,input_tokens", [("smoke", 4096), ("64k", 65536), ("128k", 131072), ("256k", 262144)])
 def test_prefix_scenario_preserves_load_and_uses_performance_mode(tmp_path, profile, input_tokens):
     baseline = scenario_module.make_scenario(
         "/models/glm53", "/data/test.jsonl", "http://localhost:20003", profile, tmp_path
@@ -66,8 +66,9 @@ def test_prefix_scenario_validates_control_origins(tmp_path, field, url):
         )
 
 
-def test_pd_scenario_cli_writes_distinct_origins_and_full_length(tmp_path):
-    output = tmp_path / "pd-128k.json"
+@pytest.mark.parametrize("profile,input_tokens", [("smoke", 4096), ("64k", 65536), ("128k", 131072), ("256k", 262144)])
+def test_pd_scenario_cli_writes_distinct_origins_and_full_length(tmp_path, profile, input_tokens):
+    output = tmp_path / f"pd-{profile}.json"
     result = subprocess.run(
         [
             sys.executable,
@@ -83,7 +84,7 @@ def test_pd_scenario_cli_writes_distinct_origins_and_full_length(tmp_path):
             "--reset-origin",
             "http://localhost:20004",
             "--profile",
-            "128k",
+            profile,
             "--output-dir",
             str(tmp_path / "results"),
             "--scenario",
@@ -94,7 +95,10 @@ def test_pd_scenario_cli_writes_distinct_origins_and_full_length(tmp_path):
         text=True,
     )
     scenario = json.loads(output.read_text())
+    assert scenario["run"]["run_id"] == f"glm53-avsg-{profile}"
+    assert scenario["service"]["inference_url"] == "http://localhost:20004/v1/completions"
     assert scenario["service"]["metrics_url"] == "http://localhost:20002/metrics"
     assert scenario["service"]["reset_url"] == "http://localhost:20004/reset_prefix_cache"
-    assert scenario["requests"]["input_length"]["value"] + scenario["requests"]["output_length"]["value"] == 131104
-    assert "131104" in result.stdout
+    assert scenario["requests"]["input_length"]["value"] == input_tokens
+    assert scenario["requests"]["output_length"]["value"] == scenario["aisbench"]["model"]["max_out_len"] == 32
+    assert str(input_tokens + 32) in result.stdout
