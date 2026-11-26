@@ -150,3 +150,52 @@ def test_zeroer_skips_remote_main_cache_and_keeps_indexer(monkeypatch, cache_spe
         num_blocks=2,
     )
     assert seen == ["indexer.0"]
+
+
+@pytest.mark.parametrize("missing", [None, "npu_avsg_match", "npu_sparse_flash_attention"])
+def test_avsg_worker_loads_required_kernels_with_general_custom_ops_disabled(monkeypatch, missing):
+    from vllm_ascend.attention import avsg_transport
+    from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
+
+    layer = object.__new__(AscendAvsgSFAImpl)
+    layer.avsg_layer_id = 0
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={"attn": SimpleNamespace(impl=layer)}),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64), dtype=torch.bfloat16
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
+    )
+    worker = SimpleNamespace(
+        vllm_config=config, device="npu:0", parallel_config=None, model_runner=SimpleNamespace(model_memory_usage=0)
+    )
+    ops = SimpleNamespace()
+    checked = []
+
+    def import_extension(name):
+        assert name == "vllm_ascend.vllm_ascend_C"
+        for op_name in ("npu_avsg_match", "npu_sparse_flash_attention"):
+
+            def has_kernel(key, name=op_name):
+                checked.append((name, key))
+                return name != missing
+
+            setattr(ops, op_name, SimpleNamespace(default=SimpleNamespace(has_kernel_for_dispatch_key=has_kernel)))
+        return SimpleNamespace(__file__="test-extension.so")
+
+    monkeypatch.setattr(worker_module, "enable_custom_op", lambda: False)
+    monkeypatch.setattr(worker_module.envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(worker_module, "import_module", import_extension)
+    monkeypatch.setattr(torch.ops, "_C_ascend", ops)
+    monkeypatch.setattr(torch.npu, "memory_allocated", lambda _: 0)
+    monkeypatch.setattr(worker_module, "get_global_rank", lambda _: 0)
+    monkeypatch.setattr(avsg_transport, "AvsgTransport", lambda **kwargs: kwargs)
+    if missing is not None:
+        with pytest.raises(RuntimeError, match=missing):
+            worker_module.NPUWorker._init_avsg_transport(worker, "endpoint.json")
+    else:
+        worker_module.NPUWorker._init_avsg_transport(worker, "endpoint.json")
+        assert layer.avsg_transport["layer_ids"] == [0]
+        assert checked == [
+            (name, torch._C.DispatchKey.PrivateUse1) for name in ("npu_avsg_match", "npu_sparse_flash_attention")
+        ]

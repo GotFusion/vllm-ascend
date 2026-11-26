@@ -21,6 +21,7 @@ import copy
 import gc
 import logging
 from contextlib import AbstractContextManager, nullcontext
+from importlib import import_module
 from types import NoneType
 from typing import Any
 
@@ -29,6 +30,7 @@ import torch.nn as nn
 import torch_npu
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
@@ -99,6 +101,7 @@ from vllm_ascend.distributed.parallel_state import get_global_rank, init_ascend_
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
+    bootstrap_custom_op_env,
     check_ascend_device_type,
     enable_custom_op,
     enable_sp,
@@ -924,8 +927,23 @@ class NPUWorker(WorkerBase):
             for layer in self.vllm_config.compilation_config.static_forward_context.values()
             if isinstance(getattr(layer, "impl", None), AscendAvsgSFAImpl)
         ]
-        if not layers or not enable_custom_op() or not hasattr(torch.ops._C_ascend, "npu_avsg_match"):
-            raise RuntimeError("AVSG requires the GLM SFA backend and a plugin built with the Ascend 950 AvsgMatch op")
+        if not layers:
+            raise RuntimeError("AVSG found no GLM attention layers using AscendAvsgSFAImpl")
+        if envs.VLLM_BATCH_INVARIANT:
+            raise RuntimeError("AVSG does not support VLLM_BATCH_INVARIANT")
+
+        # A5 disables the general custom-op path. An explicit AVSG worker needs
+        # these two NPU kernels after set_device, without enabling other paths.
+        bootstrap_custom_op_env()
+        try:
+            extension = import_module("vllm_ascend.vllm_ascend_C")
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(f"AVSG could not load vllm_ascend.vllm_ascend_C: {exc}") from exc
+        for name in ("npu_avsg_match", "npu_sparse_flash_attention"):
+            op = getattr(torch.ops._C_ascend, name, None)
+            if op is None or not op.default.has_kernel_for_dispatch_key(torch._C.DispatchKey.PrivateUse1):
+                raise RuntimeError(f"AVSG requires an NPU kernel for _C_ascend::{name} in {extension.__file__}")
+        logger.info("AVSG loaded NPU kernels from %s for %d attention layers", extension.__file__, len(layers))
         allocated = torch.npu.memory_allocated(self.device)
         model = self.vllm_config.model_config.hf_text_config
         self.avsg_transport = AvsgTransport(
