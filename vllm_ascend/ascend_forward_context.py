@@ -413,7 +413,7 @@ def select_moe_comm_method(
             draft_moe_quant_type,
         )
     logger.debug(
-        "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
+        "MoE comm method selected: policy=%s, method=%s, num_tokens=%s, mc2_capacity=%s, "
         "is_draft_model=%s, draft_moe_quant_type=%r",
         moe_comm_policy,
         moe_comm_type,
