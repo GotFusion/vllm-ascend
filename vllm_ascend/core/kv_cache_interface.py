@@ -13,6 +13,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, Slid
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -42,6 +43,32 @@ def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
         storage_block_size = kv_cache_spec.storage_block_size
         return kv_cache_spec.block_size if storage_block_size is None else storage_block_size
     return getattr(kv_cache_spec, "storage_block_size", kv_cache_spec.block_size)
+
+
+def get_avsg_cache_block_limit(
+    groups: list[KVCacheGroupSpec], peer_blocks: int, kernel_block_size: int, device_bytes: int | None = None
+) -> int:
+    """Bound scheduler block IDs by this worker's peer pages and local indexer."""
+    peer_block_sizes: set[int] = set()
+    indexer_bytes_per_block = 0
+    for group in groups:
+        for name in group.layer_names:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[name]
+            if isinstance(spec, AscendMLAAttentionSpec) and spec.store_on_peer:
+                peer_block_sizes.add(spec.block_size)
+            elif isinstance(spec, AscendSFAIndexerCacheSpec):
+                indexer_bytes_per_block += spec.page_size_bytes
+            else:
+                raise ValueError(f"Unexpected AVSG cache owner {name} with spec {type(spec).__name__}")
+    if not peer_block_sizes or any(size % kernel_block_size for size in peer_block_sizes):
+        raise ValueError(f"AVSG manager pages {sorted(peer_block_sizes)} must contain whole peer kernel pages")
+    # A global scheduler ID must fit even the layer with the most kernel pages per ID.
+    limit = peer_blocks // (max(peer_block_sizes) // kernel_block_size)
+    if device_bytes is not None and indexer_bytes_per_block:
+        limit = min(limit, max(device_bytes, 0) // indexer_bytes_per_block)
+    return limit
 
 
 def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
@@ -138,6 +165,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     cache_sparse_sfa_c8: bool = False
     cache_sparse_sfa_turboquant: bool = False
     store_on_host: bool = False
+    # AVSG addresses the full main cache on the peer using scheduler block IDs.
+    store_on_peer: bool = False
     # Ascend kernels consume padded pages through an explicit physical block
     # stride. vLLM main removed this field from AttentionSpec, but it remains
     # part of the Ascend runner/backend contract.
@@ -185,6 +214,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                 spec.cache_sparse_sfa_c8,
                 spec.cache_sparse_sfa_turboquant,
                 spec.store_on_host,
+                spec.store_on_peer,
                 spec.alignment,
                 get_kv_cache_compression_ratio(spec),
                 spec.indexes_kv_by_block_stride,
@@ -209,6 +239,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             cache_sparse_sfa_c8=first_spec.cache_sparse_sfa_c8,
             cache_sparse_sfa_turboquant=first_spec.cache_sparse_sfa_turboquant,
             store_on_host=first_spec.store_on_host,
+            store_on_peer=first_spec.store_on_peer,
             indexes_kv_by_block_stride=first_spec.indexes_kv_by_block_stride,
         )
 

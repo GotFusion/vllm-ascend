@@ -41,6 +41,9 @@
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention_vllm/sparse_flash_attention_vllm_torch_adpt.h"
+#ifdef VLLM_ASCEND_ENABLE_AVSG_MATCH
+#include "attention/avsg_match/avsg_match_torch_adpt.h"
+#endif
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
 #include "attention/kv_compress_epilog_v2/kv_compress_epilog_v2_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
@@ -2712,6 +2715,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+#ifdef VLLM_ASCEND_ENABLE_AVSG_MATCH
+    ops.def("npu_avsg_match(Tensor(a!) selection_kv_block_table, Tensor(b!) selection_kv_block_status, "
+            "Tensor(c!) selection_topk_indices, Tensor full_kv_block_table, Tensor full_kv_actual_seq, "
+            "Tensor full_q_actual_seq, int selection_topk_block_size, int kv_block_size) -> (Tensor, Tensor, Tensor)");
+    ops.impl("npu_avsg_match", c10::DispatchKey::PrivateUse1, &vllm_ascend::avsg_match);
+    ops.impl("npu_avsg_match", c10::DispatchKey::Meta, &vllm_ascend::avsg_match_outputs);
+#endif
     ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
     ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_npu_view_from_cpu_tensor);

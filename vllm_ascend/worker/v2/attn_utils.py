@@ -287,6 +287,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_dtype_str=cache_dtype_str,
                 cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                 store_on_host=enable_sfa(vllm_config) and get_ascend_config().sparse_kv_offload_config.enabled,
+                store_on_peer=enable_sfa(vllm_config) and get_ascend_config().avsg_config.enabled,
                 cache_sparse_sfa_turboquant=cache_sparse_sfa_turboquant,
                 non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 model_version=model_version,
@@ -939,6 +940,18 @@ def _allocate_sparse_c8_indexer_tensors(
     return dsa_k_tensor, dsa_k_scale_tensor
 
 
+def _allocate_indexer_cache(
+    spec: AscendSFAIndexerCacheSpec, num_blocks: int, alignment: int, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    rows = num_blocks * spec.sfa_dcp_replicated_indexer_size * spec.block_size * spec.num_kv_heads
+    key_bytes = rows * spec.head_size * get_dtype_size(spec.dtype)
+    if spec.scale_dim:
+        return _allocate_sparse_c8_indexer_tensors(
+            key_bytes, rows * spec.scale_dim * get_dtype_size(spec.scale_dtype), alignment, spec.scale_dtype, device
+        )
+    return (_allocate_int8_cache_tensor(key_bytes, alignment, device),)
+
+
 def _uses_single_raw_mla_cache(
     vllm_config: VllmConfig,
     layer_name: str,
@@ -1092,6 +1105,21 @@ def _allocate_kv_cache(
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
+    if any(getattr(spec, "store_on_peer", False) for spec in layer_kv_cache_spec.values()):
+        # The logical main pages still own scheduler slots and block tables.
+        # Their data is held by the peer; only the indexer's pages need HBM here.
+        for name, spec in layer_kv_cache_spec.items():
+            if name in shared_layers:
+                continue
+            if isinstance(spec, AscendMLAAttentionSpec) and spec.store_on_peer:
+                kv_cache_raw_tensors[name] = torch.empty(0, dtype=spec.dtype, device=device)
+            elif isinstance(spec, AscendSFAIndexerCacheSpec):
+                kv_cache_raw_tensors[name] = _allocate_indexer_cache(
+                    spec, kv_cache_config.num_blocks, alignment, device
+                )
+            else:
+                raise ValueError(f"Unexpected AVSG cache owner {name} with spec {type(spec).__name__}")
+        return kv_cache_raw_tensors
     attn_layers: dict[str, AttentionLayerBase] | None = None
     # Gemma 4 full/sliding groups share one pool while retaining contiguous
     # K/V views. The worker keeps the full budget only for this V2 path.
@@ -1298,45 +1326,10 @@ def _allocate_kv_cache(
         assert isinstance(example_spec, AttentionSpec)
 
         if isinstance(example_spec, AscendSFAIndexerCacheSpec):
-            num_blocks = kv_cache_tensor.size // example_spec.page_size_bytes
-            # vLLM #51718 packs all group layers into one tensor;
-            # kv_cache_config.num_blocks is the per-layer block count.
-            num_blocks = kv_cache_config.num_blocks
-
-            k_tensor_size = (
-                num_blocks
-                * example_spec.sfa_dcp_replicated_indexer_size
-                * example_spec.block_size
-                * example_spec.num_kv_heads
-                * example_spec.head_size
-                * get_dtype_size(example_spec.dtype)
-            )
-            if example_spec.scale_dim:
-                scale_tensor_size = (
-                    num_blocks
-                    * example_spec.sfa_dcp_replicated_indexer_size
-                    * example_spec.block_size
-                    * example_spec.num_kv_heads
-                    * example_spec.scale_dim
-                    * get_dtype_size(example_spec.scale_dtype)
-                )
-            else:
-                scale_tensor_size = None
-            # main: every layer owns its own region.
             for layer_name_inner in shared_names:
-                if scale_tensor_size is not None:
-                    kv_cache_raw_tensors[layer_name_inner] = _allocate_sparse_c8_indexer_tensors(
-                        dsa_k_tensor_size=k_tensor_size,
-                        dsa_k_scale_tensor_size=scale_tensor_size,
-                        alignment=alignment,
-                        scale_dtype=example_spec.scale_dtype,
-                        device=device,
-                    )
-                else:
-                    kv_cache_raw_tensors[layer_name_inner] = (
-                        _allocate_int8_cache_tensor(k_tensor_size, alignment, device),
-                    )
-
+                kv_cache_raw_tensors[layer_name_inner] = _allocate_indexer_cache(
+                    example_spec, kv_cache_config.num_blocks, alignment, device
+                )
             continue
 
         if all(
@@ -1576,6 +1569,13 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+            if isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.store_on_peer:
+                raw = kv_cache_raw_tensors[layer_name]
+                shape = (0, kernel_block_size, kv_cache_spec.num_kv_heads)
+                nope_dim, rope_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+                kv_caches[layer_name] = (raw.view(*shape, nope_dim), raw.view(*shape, rope_dim))
+                continue
 
             if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]

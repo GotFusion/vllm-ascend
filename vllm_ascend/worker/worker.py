@@ -48,7 +48,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups, unify_hybrid_kv_cache_specs
+from vllm.v1.core.kv_cache_utils import _pool_bytes_per_block, get_kv_cache_groups, unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -71,6 +71,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.core.kv_cache_interface import get_avsg_cache_block_limit
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     create_kvpp_cache_allocation_plan,
@@ -94,7 +95,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     plan_sparse_kv_offload_memory,
 )
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import get_global_rank, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -151,7 +152,7 @@ class NPUWorker(WorkerBase):
             _register_atb_extensions()
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
-        init_ascend_config(vllm_config)
+        self._avsg_endpoint_file = init_ascend_config(vllm_config).avsg_config.endpoint_file
         from vllm_ascend.logger import configure_ascend_file_logging
 
         configure_ascend_file_logging()
@@ -367,6 +368,8 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        if (transport := getattr(self, "avsg_transport", None)) is not None:
+            transport.close()
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
@@ -592,6 +595,8 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
+            if self._avsg_endpoint_file is not None:
+                kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(kv_cache_memory_bytes)
             return self._apply_kvpp_memory_budget(
                 self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
             )
@@ -681,6 +686,17 @@ class NPUWorker(WorkerBase):
         if not isinstance(kv_cache_spec, dict):
             return available_memory
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        if self._avsg_endpoint_file is not None:
+            transport = self.avsg_transport
+            block_limit = get_avsg_cache_block_limit(
+                kv_cache_groups, transport.remote_block_capacity, transport.block_size, available_memory
+            )
+            override = self.cache_config.num_gpu_blocks_override
+            if override is not None and override > block_limit:
+                raise ValueError(f"AVSG cannot allocate {override} blocks: local indexer and peer permit {block_limit}")
+            logger.info("AVSG local indexer and remote main KV allow up to %d scheduler blocks.", block_limit)
+            # Express the physical ID limit in Core's logical GLM pool byte units.
+            return block_limit * _pool_bytes_per_block(kv_cache_groups)
         if not kv_cache_groups:
             return available_memory
         # vLLM #51718 removed the DSV4-specific packed planner. Ascend restores
@@ -863,6 +879,8 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+            if self._avsg_endpoint_file is not None:
+                self._init_avsg_transport(self._avsg_endpoint_file)
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -875,6 +893,36 @@ class NPUWorker(WorkerBase):
                 self.device,
                 self.model_runner.get_model(),
             )
+
+    def _init_avsg_transport(self, endpoint_file: str) -> None:
+        # Load the optional backend only in workers that requested remote HBM.
+        from vllm_ascend.attention.avsg_transport import AvsgTransport
+        from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
+
+        layers = [
+            layer.impl
+            for layer in self.vllm_config.compilation_config.static_forward_context.values()
+            if isinstance(getattr(layer, "impl", None), AscendAvsgSFAImpl)
+        ]
+        if not layers or not enable_custom_op() or not hasattr(torch.ops._C_ascend, "npu_avsg_match"):
+            raise RuntimeError("AVSG requires the GLM SFA backend and a plugin built with the Ascend 950 AvsgMatch op")
+        allocated = torch.npu.memory_allocated(self.device)
+        model = self.vllm_config.model_config.hf_text_config
+        self.avsg_transport = AvsgTransport(
+            endpoint_file=endpoint_file,
+            rank=get_global_rank(self.parallel_config),
+            device=self.device,
+            layer_ids=[layer.avsg_layer_id for layer in layers],
+            block_size=128,  # AscendSFA's kernel page size, independent of scheduler group padding.
+            kv_dim=model.kv_lora_rank,
+            rope_dim=model.qk_rope_head_dim,
+            max_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=self.vllm_config.model_config.dtype,
+        )
+        for layer in layers:
+            layer.avsg_transport = self.avsg_transport
+        # The selection, staging and registered contexts live as long as the model.
+        self.model_runner.model_memory_usage += torch.npu.memory_allocated(self.device) - allocated
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Note: need to adapt for graph mode.
@@ -1184,6 +1232,15 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        if self._avsg_endpoint_file is not None:
+            # Also check the final cross-worker plan, including paths which
+            # restore an existing memory budget without profiling this worker.
+            transport = self.avsg_transport
+            peer_limit = get_avsg_cache_block_limit(
+                kv_cache_config.kv_cache_groups, transport.remote_block_capacity, transport.block_size
+            )
+            if kv_cache_config.num_blocks > peer_limit:
+                raise ValueError(f"AVSG plan requests {kv_cache_config.num_blocks} blocks, but peer holds {peer_limit}")
         speculator = getattr(self.model_runner, "speculator", None)
         speculative = self.vllm_config.speculative_config
         if (

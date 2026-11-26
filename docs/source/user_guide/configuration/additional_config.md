@@ -32,11 +32,14 @@ LLM(model="Qwen/Qwen3-8B", additional_config={"config_key":"config_value"})
 
 ### Configuration options
 
+AVSG eager stores main KV/RoPE in a peer NPU selected through a per-rank endpoint and manifest. Set the typed `avsg_config.endpoint_file` below to enable this transport. The existing sparse KV offload settings address host memory. See the [GLM-5.3 AVSG guide](../feature_guide/avsg_remote_kv.md) for peer setup and compatible serving options.
+
 The following table lists additional configuration options available in vLLM Ascend:
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
+| `avsg_config.endpoint_file`         | str or null | `None` | Per-worker HIXL endpoint JSON for peer-HBM main KV offload. A non-empty path enables AVSG eager on GLM sparse attention with BF16 main KV on Ascend 950. Use `{rank}` in multi-worker paths. Requires the V2 runner and `--enforce-eager`; each endpoint names the peer's fresh manifest. See [AVSG](../feature_guide/avsg_remote_kv.md). |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
 | `ascend_warmup_config`              | dict | `{}`    | Configuration options for startup warmup that overlaps weight loading                                     |

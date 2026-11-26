@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -107,6 +107,43 @@ class KVPPConfig:
                 raise ValueError("KVPP supports eager execution or PIECEWISE only.")
         if not model_config.use_mla or model_config.is_hybrid:
             raise ValueError("KVPP currently supports only non-hybrid MLA models.")
+
+
+@config
+class AvsgConfig:
+    """Select the per-worker peer HBM cache used by eager sparse attention."""
+
+    endpoint_file: str | None = Field(default=None, min_length=1)
+
+    @property
+    def enabled(self) -> bool:
+        return self.endpoint_file is not None
+
+    def validate(self, vc: VllmConfig, host_offload: bool, kvpp_size: int = 1) -> None:
+        if self.endpoint_file is None:
+            return
+        if not vc.use_v2_model_runner:
+            raise ValueError("avsg_config requires VLLM_USE_V2_MODEL_RUNNER=1")
+        if validate_additional_config_bool((vc.additional_config or {}).get("enable_dsa_cp", False), "enable_dsa_cp"):
+            raise ValueError("avsg_config requires enable_dsa_cp=false")
+        model = vc.model_config
+        parallel = vc.parallel_config
+        if not is_950() or model.hf_text_config.model_type != "glm_moe_dsa" or model.hf_text_config.index_topk != 2048:
+            raise ValueError("avsg_config requires GLM sparse attention with index_topk=2048 on Ascend 950")
+        if not model.enforce_eager or vc.speculative_config is not None:
+            raise ValueError("avsg_config requires --enforce-eager and single-token decode without speculation")
+        if model.enable_sleep_mode:
+            raise ValueError("avsg_config requires persistent registered device buffers and cannot use sleep mode")
+        if str(model.dtype) != "torch.bfloat16" or vc.cache_config.cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError("avsg_config requires BF16 main KV and RoPE caches")
+        if host_offload or vc.attention_config.hisparse_config is not None or vc.kv_transfer_config is not None:
+            raise ValueError("avsg_config needs locally produced KV and cannot share a cache with another KV backend")
+        if kvpp_size > 1:
+            raise ValueError("avsg_config requires per-worker ownership of all local layers and cannot use KVPP")
+        if max(parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size) > 1:
+            raise ValueError("avsg_config requires an unsharded context on each rank")
+        if parallel.world_size * parallel.data_parallel_size > 1 and "{rank}" not in self.endpoint_file:
+            raise ValueError("avsg_config.endpoint_file must include {rank} for a multi-worker deployment")
 
 
 @config
@@ -568,8 +605,9 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -621,6 +659,7 @@ class AscendConfig:
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
+    avsg_config: AvsgConfig = dataclasses.field(default_factory=AvsgConfig)
 
     # ---- sub-configs declared later in this module ----
     # Lambdas defer class lookup until construction, after module initialization.
@@ -677,6 +716,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self.avsg_config.validate(vc, self.sparse_kv_offload_config.enabled, self.kvpp_config.size)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

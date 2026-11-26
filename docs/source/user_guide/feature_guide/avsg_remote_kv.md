@@ -1,0 +1,118 @@
+# GLM-5.3 的 AVSG eager 验证
+
+此分支基于 `releases/v0.30.0@6cbe76554e6f9dd4c487a3c46a15613684f7147e`，将 GLM 的历史主 KV 和 RoPE 放在独立 peer NPU 的 HBM。模型卡保留 Lightning Indexer 缓存，以及所有注意力层共用的当步写入暂存和 8192 行选择缓冲。新 KV 写入 peer 后，AVSG 按每个查询的因果 TopK 读取所需行，再计算 SFA。前缀命中沿用调度器分配的远端物理页。
+
+配套上游 vLLM 为 `v0.30.0@ced6857a`。AVSG eager 与原生算子从已有适配提交 `a5db3fde8` 迁入，其 recipes 源版本为 `d107a3e106866344c05c6ba58948ab1f196c6169`，HIXL 源版本为 `5ac7f35b4aa916db77aac58ea6d3d5c16e20f5fe`。本轮源码与主机验证记录对应当前分支，设备结果需在该组合上重新取得。
+
+本次迁移先验证 GLM-5.3 的单服务 eager。启用 `VLLM_USE_V2_MODEL_RUNNER=1`、`--enforce-eager` 和 BF16 主 KV。每个计算 rank 对应一个独立 peer。Prefill/Decode 分离、旧 host KV offload、推测解码、上下文并行和图执行尚不属于此接入的支持范围。
+
+发布分支的 `SparseFlashAttentionVllm` 保留 `torch.ops._C_ascend.npu_sparse_flash_attention` 入口，本适配使用该分支已有的 SFA。普通 FlashComm1 在注意力前会还原完整 token，可沿用 `enable_flashcomm1`，设备效果待复测。`enable_dsa_cp` 需要关闭。
+
+验证参数来自用户的 `opsLearning/operator-libraries/vllm-ascend/log`。其中模型目录为 `/mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916/`，服务 seed 为 1024，初步流程使用 5 层 dummy。日志中的服务长度为 8192/13500，性能场景却请求 131072 个输入 token。这里分别提供 4096-token 冒烟与 131072-token 长输入配置，服务容量还须包含 32 个输出 token。模型使用 MXFP4 权重格式，AVSG 当前使用 BF16 主 KV/RoPE；indexer 格式单独设置。
+
+## 编译与通信配置
+
+在 Ascend Linux 上使用与 vLLM 0.30.0 匹配的 CANN、ASC、PyTorch、torch_npu 环境，并从本分支构建插件。设备编译、模型生成和性能测量在服务器阶段执行。
+
+```bash
+export SOC_VERSION=ascend950dt_9582
+COMPILE_CUSTOM_KERNELS=1 python3 -m pip install -e . --no-build-isolation
+```
+
+两端的 URMA 扩展使用 HIXL `avsg@5ac7f35b4aa916db77aac58ea6d3d5c16e20f5fe` 的 launcher ABI。构建该 HIXL，再将库目录传给扩展。[HIXL 源码版本](https://gitcode.com/wangzhenwu/hixl_avsg/tree/5ac7f35b4aa916db77aac58ea6d3d5c16e20f5fe)
+
+```bash
+export HIXL_SOURCE_DIR=/path/to/hixl-avsg
+export HIXL_LIBRARY_DIR=/path/to/rebuilt/hixl/lib
+export LD_LIBRARY_PATH="$HIXL_LIBRARY_DIR:${LD_LIBRARY_PATH:-}"
+python3 -m pip install --no-build-isolation ./csrc/avsg_urma
+python3 -c 'import torch, torch_npu; from avsg_urma import AvsgUrmaSession'
+```
+
+以下以 TP1 为例。一张模型卡和一张 peer 卡各自只暴露本端设备，进程内设备编号均为 0。为两端设置唯一 HIXL engine 地址，并使用现场生成的通信资源 JSON。共享目录须为本次启动新建，peer 的 manifest 包含本次分配的地址。读取 checkpoint 的 `num_hidden_layers`、`kv_lora_rank`、`qk_rope_head_dim` 核对层数与维度。下面 5 层与后面的 dummy 服务一致，完整权重验证时改成实际层数。
+
+```bash
+RUN_DIR=/shared/glm53-avsg/run-001
+mkdir -p "$RUN_DIR"
+PEER_ENGINE=peer-address-from-site
+MODEL_ENGINE=model-address-from-site
+BLOCKS=1024
+
+jq -n --slurpfile res /path/to/peer-comm-res.json \
+  --arg engine "$PEER_ENGINE" --argjson blocks "$BLOCKS" \
+  '{device: 0, local_engine: $engine, local_comm_res: $res[0], channels: 1,
+    manifest: "manifest-0.json", cache: {layers: 5, blocks: $blocks,
+    block_size: 128, kv_dim: 512, rope_dim: 64, dtype: "bfloat16"}}' \
+  > "$RUN_DIR/server-0.json"
+jq -n --slurpfile res /path/to/model-comm-res.json \
+  --arg model "$MODEL_ENGINE" --arg peer "$PEER_ENGINE" \
+  '{local_engine: $model, peer_engine: $peer, local_comm_res: $res[0],
+    channels: 1, timeout_ms: 30000, remote_manifest: "manifest-0.json"}' \
+  > "$RUN_DIR/endpoint-0.json"
+
+ASCEND_RT_VISIBLE_DEVICES=7 python3 csrc/avsg_urma/examples/d2d_cache_server.py \
+  --config "$RUN_DIR/server-0.json"
+```
+
+等 peer 打印注册成功并生成 manifest 后启动模型。多 rank 时，每个 rank 需要独立的 endpoint、peer 和通信资源，`endpoint_file` 中使用 `{rank}`。
+
+## 两组 eager 服务
+
+以下命令从仓库根目录执行。先用本地 KV 启动，再在相同模型卡上重启 AVSG，保存两组各自的命令与日志。将 `ADDITIONAL` 改成 AVSG 配置即可使用同一套参数。
+
+```bash
+MODEL_PATH=/mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916
+RUN_DIR=/shared/glm53-avsg/run-001
+ADDITIONAL='{}'
+# AVSG 组使用下面这行
+# ADDITIONAL="{\"avsg_config\":{\"endpoint_file\":\"$RUN_DIR/endpoint-0.json\"}}"
+
+ASCEND_RT_VISIBLE_DEVICES=6 VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$MODEL_PATH" \
+  --host 127.0.0.1 --port 20003 --served-model-name glm53 \
+  --tensor-parallel-size 1 --data-parallel-size 1 --seed 1024 \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 --quantization ascend \
+  --enforce-eager --enable-prefix-caching --enable-chunked-prefill \
+  --max-model-len 8192 --max-num-batched-tokens 512 --max-num-seqs 16 \
+  --block-size 128 --num-gpu-blocks-override 1024 --gpu-memory-utilization 0.8 \
+  --trust-remote-code --load-format dummy \
+  --hf-overrides '{"num_hidden_layers":5,"use_index_cache":true}' \
+  --additional-config "$ADDITIONAL"
+```
+
+小 prefill 调度窗口用于覆盖分块写出和远端历史读回。5 层 dummy 用于检查服务、量化层初始化及通信路径。精度验收需另用同一份真实裁层或完整 checkpoint，移除 `--load-format dummy`，将 peer 的层数与真实模型配置匹配后比较生成 ID。原日志中的 MMC、KV connector 和代理属于 PD 场景，AVSG 服务在同一个 worker 完成 prefill 和 decode。
+
+```bash
+curl --fail http://127.0.0.1:20003/v1/models
+curl --fail http://127.0.0.1:20003/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm53","prompt":"The first three prime numbers are", "seed":1024,"temperature":0,"max_tokens":32,"ignore_eos":true,"return_token_ids":true}'
+```
+
+用相同请求检查两组输出，并保留每层远端 WRITE/READ 完成状态、prefix hit 计数、peer 容量和模型卡主 KV/RoPE backing storage。后者应为 0 字节，实际设备存储由 indexer 与共享暂存、选择缓冲持有。
+
+## ais-bench 性能配置
+
+配置生成器保留原日志的 5 条请求、32-token 输出、batch size 2、流式输出和 90% 目标前缀命中率。`--profile smoke` 使用 4096-token 输入，`--profile 128k` 使用 131072-token 输入。前缀生成器需要日志所用的 `ais_bench_prefix_cache` 扩展。此扩展不随 vLLM Ascend 或 AISBench 安装，需在服务器安装已有验证环境使用的版本。安装后检查两个 CLI 与配置导入。
+
+```bash
+ais_bench --help
+ais-bench-prefix-cache --help
+python3 -c 'from ais_bench_prefix_cache.config import build_dataset_config, build_model_config'
+python3 examples/avsg/glm53_scenario.py \
+  --model /mnt/share/w00936111/GLM-5.3-W4A4C8-MXFP4-0916 \
+  --corpus /code/benchmark/ais_bench/datasets/gsm8k/test.jsonl \
+  --service-url http://127.0.0.1:20003 --profile smoke \
+  --output-dir /shared/glm53-avsg/local-smoke --scenario /shared/glm53-avsg/local-smoke.json
+ais-bench-prefix-cache inspect --scenario /shared/glm53-avsg/local-smoke.json
+ais-bench-prefix-cache prepare --mode text --scenario /shared/glm53-avsg/local-smoke.json
+ais-bench-prefix-cache run --scenario /shared/glm53-avsg/local-smoke.json \
+  --config "$PWD/examples/avsg/prefix_cache_perf.py"
+```
+
+AVSG 组使用相同命令，改用独立的 `avsg-smoke` 输出路径，并核对生成数据的 SHA256、分词长度、请求顺序与本地组一致。每组从新启动且无历史请求的服务开始，先完成场景自身的 warmup，再统计正式请求。配置写入 `--mode perf`，汇总器使用 `DefaultPerfSummarizer`，采集实际输入/输出 token、前缀命中率、TTFT、TPOT、吞吐与失败率。报告中同时记录模型为 dummy 或真实权重、TP、HBM 用量和数据规模。[AISBench 性能模式](https://github.com/AISBench/benchmark/blob/master/docs/source_en/base_tutorials/scenes_intro/performance_benchmark.md)
+
+128k 组将场景改成 `--profile 128k`，两种服务都将 `--max-model-len` 设为至少 131104，可使用 131200。为容纳 16 个各长 131200 的请求，可将两组的 `--num-gpu-blocks-override` 和 peer `blocks` 均设为 16400，先核算本地参考组和 peer 的实际 HBM。5 层 BF16 主 KV/RoPE 在该布局约占 11.26 GiB。可按目标并发下调 `--max-num-seqs` 与页数，保证相同负载与相同容量约束。性能组的 `--max-num-batched-tokens` 可恢复为日志的 8192，两种路径保持一致。
+
+上述页数按调度页与算子页均为 128 token 计算。如果运行时调度器合并为更大的页，peer 所需页数应乘以 `scheduler_block_size / 128`。worker 会按该比例检查配置，同时计入本地 indexer 的容量。
+
+本机仅验证配置生成、Python 语法和调用参数。`ais_bench_prefix_cache` 的端到端生成、模型加载、远端通信、精度和性能由后续服务器验证提供结果。

@@ -1,0 +1,212 @@
+diff --git a/include/hixl/hixl.h b/include/hixl/hixl.h
+index 319fbf3..fa19259 100644
+--- a/include/hixl/hixl.h
++++ b/include/hixl/hixl.h
+@@ -222,6 +222,11 @@ class ASCEND_FUNC_VISIBILITY Hixl {
+   Status GetAddr(const AscendString &remote_engine, uintptr_t remote_va, size_t len, uint32_t mem_type,
+                  uintptr_t &addr);
+ 
++  /** Export borrowed AIV channel device pointers after Connect. The caller must exclusively
++   * drive these channels and finish all device work before Disconnect/DeregisterMem/Finalize.
++   * Pointers are invalidated by disconnect; no channel or engine ownership is transferred. */
++  Status GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels);
++
+  private:
+   class HixlImpl;
+   std::unique_ptr<HixlImpl> impl_;
+diff --git a/src/hixl/aiv/aiv_channel_manager.cc b/src/hixl/aiv/aiv_channel_manager.cc
+index c0cf753..7de1341 100644
+--- a/src/hixl/aiv/aiv_channel_manager.cc
++++ b/src/hixl/aiv/aiv_channel_manager.cc
+@@ -10,6 +10,8 @@
+ 
+ #include "aiv/aiv_channel_manager.h"
+ 
++#include <set>
++
+ #include "aiv/urma_backend.h"
+ #include "common/hixl_checker.h"
+ #include "common/hixl_log.h"
+@@ -42,10 +44,18 @@ void AivChannelManager::Finalize() {
+   HIXL_LOGI("AivChannelManager finalize success");
+ }
+ 
+-Status AivChannelManager::RegisterChannel(const std::string &remote_engine, uint64_t channel_ptr, bool simt_mode) {
++Status AivChannelManager::RegisterChannel(const std::string &remote_engine, uint64_t channel_ptr, bool simt_mode,
++                                         const std::vector<uint64_t> &channel_ptrs) {
+   std::lock_guard<std::mutex> lock(mutex_);
+   HIXL_CHK_BOOL_RET_STATUS(initialized_ && backend_ != nullptr, FAILED, "AivChannelManager is not initialized");
+   ChannelEntry entry{};
++  entry.channel_ptrs = channel_ptrs.empty() ? std::vector<uint64_t>{channel_ptr} : channel_ptrs;
++  HIXL_CHK_BOOL_RET_STATUS(entry.channel_ptrs.front() == channel_ptr &&
++                           std::set<uint64_t>(entry.channel_ptrs.begin(), entry.channel_ptrs.end()).size() ==
++                             entry.channel_ptrs.size(), PARAM_INVALID, "Invalid duplicate or mismatched AIV channels");
++  for (auto ptr : entry.channel_ptrs) {
++    HIXL_CHK_BOOL_RET_STATUS(ptr != 0UL, PARAM_INVALID, "Invalid null AIV channel pointer");
++  }
+   entry.ctx.remote_engine = remote_engine;
+   entry.ctx.channel_ptr = channel_ptr;
+   entry.ctx.simt_mode = simt_mode;
+@@ -101,6 +111,19 @@ Status AivChannelManager::GetChannelPtr(const std::string &remote_engine, uint64
+   return SUCCESS;
+ }
+ 
++Status AivChannelManager::GetChannelPointers(const std::string &remote_engine,
++                                            std::vector<uint64_t> &channels) const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  channels.clear();
++  auto it = channels_.find(remote_engine);
++  HIXL_CHK_BOOL_RET_STATUS(it != channels_.end(), NOT_CONNECTED,
++                           "No AIV channels for peer:%s", remote_engine.c_str());
++  HIXL_CHK_BOOL_RET_STATUS(it->second.healthy, FAILED,
++                           "AIV channels are unhealthy, peer:%s", remote_engine.c_str());
++  channels = it->second.channel_ptrs;
++  return SUCCESS;
++}
++
+ Status AivChannelManager::GetChannelMode(const std::string &remote_engine, bool &simt_mode) const {
+   std::lock_guard<std::mutex> lock(mutex_);
+   auto it = channels_.find(remote_engine);
+diff --git a/src/hixl/aiv/aiv_channel_manager.h b/src/hixl/aiv/aiv_channel_manager.h
+index 5fb49a8..9bcbb77 100644
+--- a/src/hixl/aiv/aiv_channel_manager.h
++++ b/src/hixl/aiv/aiv_channel_manager.h
+@@ -57,7 +57,10 @@ class AivChannelManager {
+    * @param [in] simt_mode 驱动模式：false=SIMD（AICORE scalar 直驱），true=SIMT
+    * @return 成功:SUCCESS, 失败:其它.
+    */
+-  Status RegisterChannel(const std::string &remote_engine, uint64_t channel_ptr, bool simt_mode);
++  Status RegisterChannel(const std::string &remote_engine, uint64_t channel_ptr, bool simt_mode,
++                         const std::vector<uint64_t> &channel_ptrs = {});
++
++  Status GetChannelPointers(const std::string &remote_engine, std::vector<uint64_t> &channels) const;
+ 
+   /**
+    * @brief 移除登记的对端通道（断链后调用）
+@@ -110,6 +113,7 @@ class AivChannelManager {
+ 
+  private:
+   struct ChannelEntry {
++    std::vector<uint64_t> channel_ptrs;
+     ChannelCtx ctx{};
+     bool healthy{true};
+     uint32_t last_status{0U};     ///< 最近一次上抛的错误码（0 表示无错误）
+diff --git a/src/hixl/engine/aiv_engine.cc b/src/hixl/engine/aiv_engine.cc
+index 08d3248..236bfdb 100644
+--- a/src/hixl/engine/aiv_engine.cc
++++ b/src/hixl/engine/aiv_engine.cc
+@@ -226,7 +226,8 @@ Status AivEngine::Connect(const AscendString &remote_engine, int32_t timeout_in_
+   }
+   // 登记首条通道（GetDeviceChannelPtr 保持单值快照语义，供单 jetty 自研 kernel launch
+   // 场景；多 jetty 的 channel 表下发编排在 CS 层 client 维护，见 HixlCSClient）
+-  Status ret = channel_manager_.RegisterChannel(remote_engine.GetString(), channel_ptrs[0], kDefaultAivSimtMode);
++  Status ret = channel_manager_.RegisterChannel(remote_engine.GetString(), channel_ptrs[0],
++                                                kDefaultAivSimtMode, channel_ptrs);
+   if (ret != SUCCESS) {
+     HIXL_LOGW("[AivEngine] Register aiv channel failed, direct-drive degraded to fallback path, "
+               "local_engine:%s, remote_engine:%s, ret=%u",
+@@ -391,6 +392,10 @@ Status AivEngine::GetDeviceChannelMode(const AscendString &remote_engine, bool &
+   return channel_manager_.GetChannelMode(remote_engine.GetString(), simt_mode);
+ }
+ 
++Status AivEngine::GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels) {
++  return channel_manager_.GetChannelPointers(remote_engine.GetString(), channels);
++}
++
+ Status AivEngine::ReportChannelError(const AscendString &remote_engine, uint32_t status, uint32_t substatus) {
+   return channel_manager_.ReportChannelError(remote_engine.GetString(), status, substatus);
+ }
+diff --git a/src/hixl/engine/aiv_engine.h b/src/hixl/engine/aiv_engine.h
+index 3c9974c..9443c3e 100644
+--- a/src/hixl/engine/aiv_engine.h
++++ b/src/hixl/engine/aiv_engine.h
+@@ -172,6 +172,7 @@ class AivEngine : public Engine {
+    * @return 成功:SUCCESS, 未建链/未创建AIV通道:NOT_CONNECTED, 通道不健康:FAILED, 失败:其它.
+    */
+   Status GetDeviceChannelPtr(const AscendString &remote_engine, uint64_t &channel_ptr);
++  Status GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels) override;
+ 
+   /**
+    * @brief 查询对端 AIV 通道驱动模式（决定 kernel 侧使用 SIMD 或 SIMT Device API 头）
+diff --git a/src/hixl/engine/engine.h b/src/hixl/engine/engine.h
+index accfefe..bb428aa 100644
+--- a/src/hixl/engine/engine.h
++++ b/src/hixl/engine/engine.h
+@@ -85,6 +85,12 @@ class Engine {
+     return UNSUPPORTED;
+   }
+ 
++  virtual Status GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels) {
++    (void)remote_engine;
++    channels.clear();
++    return UNSUPPORTED;
++  }
++
+  protected:
+   std::string local_engine_;
+ };
+diff --git a/src/hixl/engine/hixl_impl.cc b/src/hixl/engine/hixl_impl.cc
+index 34f4063..cac843b 100644
+--- a/src/hixl/engine/hixl_impl.cc
++++ b/src/hixl/engine/hixl_impl.cc
+@@ -78,6 +78,8 @@ class Hixl::HixlImpl {
+   Status GetAddr(const AscendString &remote_engine, uintptr_t remote_va, size_t len, uint32_t mem_type,
+                  uintptr_t &addr);
+ 
++  Status GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels);
++
+  private:
+   std::mutex mutex_;
+   std::string local_engine_;
+@@ -271,6 +273,20 @@ Status Hixl::HixlImpl::GetAddr(const AscendString &remote_engine, uintptr_t remo
+   return SUCCESS;
+ }
+ 
++Status Hixl::HixlImpl::GetAivChannelPointers(const AscendString &remote_engine,
++                                           std::vector<uint64_t> &channels) {
++  std::lock_guard<std::mutex> lk(mutex_);
++  channels.clear();
++  HIXL_CHK_BOOL_RET_STATUS(engine_ != nullptr && engine_->IsInitialized(), FAILED,
++                           "Hixl is not initialized");
++  return engine_->GetAivChannelPointers(remote_engine, channels);
++}
++
++Status Hixl::GetAivChannelPointers(const AscendString &remote_engine, std::vector<uint64_t> &channels) {
++  HIXL_CHK_BOOL_RET_STATUS(impl_ != nullptr, FAILED, "Hixl is not initialized");
++  return impl_->GetAivChannelPointers(remote_engine, channels);
++}
++
+ Hixl::Hixl() {}
+ 
+ Hixl::~Hixl() {
+diff --git a/tests/cpp/hixl/aiv/aiv_channel_manager_ut.cc b/tests/cpp/hixl/aiv/aiv_channel_manager_ut.cc
+index 428c4cb..ad8e8b0 100644
+--- a/tests/cpp/hixl/aiv/aiv_channel_manager_ut.cc
++++ b/tests/cpp/hixl/aiv/aiv_channel_manager_ut.cc
+@@ -193,4 +193,26 @@ TEST_F(AivChannelManagerUTest, NotInitializedFails) {
+   uint64_t channel_ptr = 0UL;
+   EXPECT_EQ(manager.GetChannelPtr(kRemoteEngineA, channel_ptr), NOT_CONNECTED);
+ }
++TEST_F(AivChannelManagerUTest, ExportAllChannelsAndInvalidateOnRemoval) {
++  const std::vector<uint64_t> input{kTestChannelPtrA, kTestChannelPtrB};
++  ASSERT_EQ(manager_->RegisterChannel(kRemoteEngineA, input[0], true, input), SUCCESS);
++  std::vector<uint64_t> output;
++  ASSERT_EQ(manager_->GetChannelPointers(kRemoteEngineA, output), SUCCESS);
++  EXPECT_EQ(output, input);
++  ASSERT_EQ(manager_->RemoveChannel(kRemoteEngineA), SUCCESS);
++  EXPECT_EQ(manager_->GetChannelPointers(kRemoteEngineA, output), NOT_CONNECTED);
++  EXPECT_TRUE(output.empty());
++}
++
++TEST_F(AivChannelManagerUTest, ExportRejectsUnhealthyAndDuplicateChannels) {
++  EXPECT_EQ(manager_->RegisterChannel(kRemoteEngineA, kTestChannelPtrA, true,
++                                      {kTestChannelPtrA, kTestChannelPtrA}), PARAM_INVALID);
++  ASSERT_EQ(manager_->RegisterChannel(kRemoteEngineA, kTestChannelPtrA, true,
++                                      {kTestChannelPtrA, kTestChannelPtrB}), SUCCESS);
++  ASSERT_EQ(manager_->ReportChannelError(kRemoteEngineA, 1U, 2U), SUCCESS);
++  std::vector<uint64_t> output{kTestChannelPtrA};
++  EXPECT_EQ(manager_->GetChannelPointers(kRemoteEngineA, output), FAILED);
++  EXPECT_TRUE(output.empty());
++}
++
+ }  // namespace hixl

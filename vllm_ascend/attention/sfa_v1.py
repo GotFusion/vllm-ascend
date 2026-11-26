@@ -386,6 +386,10 @@ class AscendSFABackend(AttentionBackend):
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
             return AscendSFAKVOffloadImpl
+        if get_ascend_config().avsg_config.enabled:
+            from vllm_ascend.attention.sfa_avsg import AscendAvsgSFAImpl
+
+            return AscendAvsgSFAImpl
         from vllm_ascend.attention.context_parallel.sfa_cp import resolve_sfa_impl
 
         return resolve_sfa_impl(get_current_vllm_config())
@@ -448,6 +452,9 @@ class AscendSFAMetadata:
     smla_topk_length: torch.Tensor | None = None
     smla_valid_mask: torch.Tensor | None = None
     smla_sinks: torch.Tensor | None = None
+    # Profiling batches must never publish rows to the peer cache.
+    offload_dummy: bool = False
+    query_start_loc_cpu: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -711,6 +718,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             block_size=block_size,
+            offload_dummy=common_attn_metadata.offload_dummy,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu[: num_reqs + 1],
             **parallel_metadata,
         )
         (
@@ -1826,6 +1835,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         return attn_metadata.slot_mapping
 
+    def _on_kv_cache_written(self, kv_cache, attn_metadata: M) -> None:
+        """Allow a peer-backed implementation to publish the staged main KV."""
+
     def _compose_sfa_kv_cache(self, kv_cache) -> tuple[torch.Tensor, ...] | None:
         """Compose split cache handles into the tuple expected by SFA kernels.
 
@@ -2137,6 +2149,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # by this point all of the layer's KV (main + indexer) has been
         # scattered - indexer layers persisted it inside indexer.forward
         # above - so the connector can dispatch the PD pull.
+        self._on_kv_cache_written(kv_cache, attn_metadata)
         notify_kv_cache_written(self.layer_name or "")
 
         # Open the prefetch gate for every SFA layer. Some GLM-5.2 layers
