@@ -31,9 +31,19 @@ def make_scenario(
     profile: str,
     output_dir: Path,
     *,
+    request_count: int = 5,
+    concurrency: int = 2,
+    output_tokens: int = OUTPUT_TOKENS,
     metrics_origin: str | None = None,
     reset_origin: str | None = None,
 ) -> dict:
+    for name, value in (
+        ("request_count", request_count),
+        ("concurrency", concurrency),
+        ("output_tokens", output_tokens),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     service_url = normalize_origin(service_url, "service_url")
     metrics_origin = normalize_origin(metrics_origin if metrics_origin is not None else service_url, "metrics_origin")
     reset_origin = normalize_origin(reset_origin if reset_origin is not None else service_url, "reset_origin")
@@ -49,9 +59,9 @@ def make_scenario(
         "tokenizer": {"path": model_path, "block_size": BLOCK_SIZE, "revision": None, "trust_remote_code": True},
         "corpus": {"path": corpus_path, "field": "question", "selection": {"mode": "random"}},
         "requests": {
-            "count": 5,
+            "count": request_count,
             "input_length": {"mode": "fixed", "value": input_tokens},
-            "output_length": {"mode": "fixed", "value": OUTPUT_TOKENS},
+            "output_length": {"mode": "fixed", "value": output_tokens},
         },
         "output": {"output_key": None},
         "prefix_cache": {
@@ -90,9 +100,9 @@ def make_scenario(
                 "abbr": None,
                 "attr": "service",
                 "stream": True,
-                "max_out_len": OUTPUT_TOKENS,
+                "max_out_len": output_tokens,
                 "retry": 2,
-                "batch_size": 2,
+                "batch_size": concurrency,
                 "generation_kwargs": {"temperature": 0, "ignore_eos": True},
             },
         },
@@ -107,6 +117,11 @@ def main() -> None:
     parser.add_argument("--metrics-origin", help="HTTP(S) origin for prefix metrics; use the P server for PD")
     parser.add_argument("--reset-origin", help="HTTP(S) origin for cache reset; the layerwise PD proxy resets P and D")
     parser.add_argument("--profile", choices=PROFILE_INPUT_TOKENS, default="smoke")
+    parser.add_argument("--request-count", type=int, default=5, help="Number of measured requests (default: 5)")
+    parser.add_argument("--concurrency", type=int, default=2, help="AISBench batch size (default: 2)")
+    parser.add_argument(
+        "--output-tokens", type=int, default=OUTPUT_TOKENS, help="Output tokens per request (default: 32)"
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--scenario", required=True, type=Path)
     args = parser.parse_args()
@@ -117,6 +132,9 @@ def main() -> None:
             args.service_url,
             args.profile,
             args.output_dir,
+            request_count=args.request_count,
+            concurrency=args.concurrency,
+            output_tokens=args.output_tokens,
             metrics_origin=args.metrics_origin,
             reset_origin=args.reset_origin,
         )
@@ -126,7 +144,7 @@ def main() -> None:
     with args.scenario.open("x", encoding="utf-8") as output:
         json.dump(scenario, output, ensure_ascii=False, indent=2)
         output.write("\n")
-    minimum_length = PROFILE_INPUT_TOKENS[args.profile] + OUTPUT_TOKENS
+    minimum_length = PROFILE_INPUT_TOKENS[args.profile] + args.output_tokens
     print(f"Wrote {args.scenario}; service max-model-len must be at least {minimum_length}.")
 
 

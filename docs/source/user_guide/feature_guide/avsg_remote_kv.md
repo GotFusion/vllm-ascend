@@ -240,7 +240,7 @@ ais-bench-prefix-cache run --scenario /shared/glm53-avsg/pd-smoke.json \
 
 场景 warmup 和正式推理均通过 20004 proxy；缓存 reset 经 proxy 清除 P/D，命中率从 20002 的 P 指标采集。按上面的 D 无 prefix 配置，正式请求会回到 P 复用 warmup 的前缀。核对 P `vllm:prefix_cache_queries` 与 `vllm:prefix_cache_hits` 的正式请求增量后再报告实际命中率，不能用 D 指标或目标值 90% 代替实测值。`ais_bench_prefix_cache` 的现场版本仍需确认其 warmup/reset 顺序及 Prometheus 指标兼容性；本地只验证生成的配置和 URL 路由。
 
-64K/128K/256K 场景的长度均为 token 数，输出固定 32 token。单服务和 PD 的 **P、D 两端**都须配置足够的 `--max-model-len`，不能沿用原日志的 8192/13500：
+64K/128K/256K 场景的长度均为 token 数，默认输出 32 token。单服务和 PD 的 **P、D 两端**都须配置足够的 `--max-model-len`，不能沿用原日志的 8192/13500：
 
 | profile | 输入 token | 输出 token | 最小 max-model-len | 按 128 对齐的长度 |
 | --- | ---: | ---: | ---: | ---: |
@@ -275,6 +275,23 @@ done
 启动前同时核对 checkpoint 支持的上下文长度、服务的 `--num-gpu-blocks-override` 和 peer `blocks`；256K 输入还要容纳 32 个输出 token。按实际并发和缓存组分配页数，计入调度器保留的空页，不沿用 smoke 的 1024 页。本次 PD 性能测试按参考日志保留 `--max-num-batched-tokens` **P=8192、D=60**，三种输入长度均使用这个组合，并在结果表中记录两端实际值；比较路径时保持相同负载与容量约束。
 
 上述页数按调度页与算子页均为 128 token 计算。如果运行时调度器合并为更大的页，peer 所需页数应乘以 `scheduler_block_size / 128`。worker 会按该比例检查配置，同时计入本地 indexer 的容量。
+
+新一轮使用 8 条正式请求、并发 8、每条输出 64 token 时，在独立目录生成配置，保留上面的 5/2/32 默认值和既有结果。沿用前面设置的 `MODEL_PATH`、`CORPUS_PATH`：
+
+```bash
+RESULTS_ROOT=/shared/glm53-avsg/mtp0-lengths-8x64-run-001
+for profile in 64k 128k 256k; do
+  python3 examples/avsg/glm53_scenario.py \
+    --model "$MODEL_PATH" --corpus "$CORPUS_PATH" \
+    --service-url http://127.0.0.1:20004 \
+    --metrics-origin http://127.0.0.1:20002 --reset-origin http://127.0.0.1:20004 \
+    --request-count 8 --concurrency 8 --output-tokens 64 \
+    --profile "$profile" --output-dir "$RESULTS_ROOT/$profile" \
+    --scenario "$RESULTS_ROOT/$profile.json"
+done
+```
+
+每档正式请求的输入总量为 `8 × 输入长度`，输出总量为 512 token，不包含场景 warmup。P、D 的 `--max-num-seqs` 均须至少为 8，`--max-model-len` 至少为 `输入长度 + 64`。同时按 8 路并发、实际缓存组和调度页大小重新核算 P 本地 KV、D indexer 与 peer 页容量，计入调度器保留空页；不能沿用并发 2 的页数。上述 inspect、prepare 和 run 命令使用新场景路径。
 
 在 950DT 的真实五层 smoke 中，vLLM 0.30.0 的 P、D 均完成了 20 个权重分片的加载。提交 `5bb0952e9` 使用 `device_urma` 将 4096-token prompt 的主 KV 逐层经单页 ingress 写到 peer；五层均在写完 32 页后返回 READ_DONE，实际生成 32 个 token。该结果验证了端到端功能。三档长输入的性能取自各自的正式 AISBench 输出。
 

@@ -27,6 +27,7 @@ def test_prefix_scenario_preserves_load_and_uses_performance_mode(tmp_path, prof
     assert baseline["requests"]["count"] == 5
     assert baseline["requests"]["input_length"]["value"] == input_tokens
     assert baseline["requests"]["output_length"]["value"] == baseline["aisbench"]["model"]["max_out_len"] == 32
+    assert baseline["aisbench"]["model"]["batch_size"] == 2
     assert baseline["prefix_cache"]["target_hit_rate"] == 0.9
     assert baseline["aisbench"]["extra_args"]["--mode"] == "perf"
     assert baseline["service"]["model"] == "glm53"
@@ -102,3 +103,72 @@ def test_pd_scenario_cli_writes_distinct_origins_and_full_length(tmp_path, profi
     assert scenario["requests"]["input_length"]["value"] == input_tokens
     assert scenario["requests"]["output_length"]["value"] == scenario["aisbench"]["model"]["max_out_len"] == 32
     assert str(input_tokens + 32) in result.stdout
+
+
+@pytest.mark.parametrize("profile,input_tokens", [("64k", 65536), ("128k", 131072), ("256k", 262144)])
+def test_scenario_cli_configures_eight_concurrent_requests_and_64_output_tokens(tmp_path, profile, input_tokens):
+    output = tmp_path / f"eight-requests-{profile}.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--model",
+            "/models/glm53",
+            "--corpus",
+            "/data/test.jsonl",
+            "--profile",
+            profile,
+            "--request-count",
+            "8",
+            "--concurrency",
+            "8",
+            "--output-tokens",
+            "64",
+            "--output-dir",
+            str(tmp_path / "results"),
+            "--scenario",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scenario = json.loads(output.read_text())
+    requests = scenario["requests"]
+    model = scenario["aisbench"]["model"]
+    assert requests["count"] == model["batch_size"] == 8
+    assert requests["count"] * requests["input_length"]["value"] == 8 * input_tokens
+    assert requests["output_length"]["value"] == model["max_out_len"] == 64
+    assert requests["count"] * requests["output_length"]["value"] == 512
+    assert str(input_tokens + 64) in result.stdout
+
+
+@pytest.mark.parametrize("field", ["request_count", "concurrency", "output_tokens"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_scenario_rejects_nonpositive_load_settings(tmp_path, field, value):
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        scenario_module.make_scenario(
+            "/models/glm53", "/data/test.jsonl", "http://localhost:20003", "smoke", tmp_path, **{field: value}
+        )
+    output = tmp_path / "invalid.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--model",
+            "/models/glm53",
+            "--corpus",
+            "/data/test.jsonl",
+            "--output-dir",
+            str(tmp_path / "results"),
+            "--scenario",
+            str(output),
+            "--" + field.replace("_", "-"),
+            str(value),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert f"{field} must be a positive integer" in result.stderr
+    assert not output.exists()
