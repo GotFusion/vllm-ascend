@@ -526,8 +526,26 @@ class SFAPDRD2HConsumerWorker:
                 main_tensor_count=0,
                 has_indexer=bool(caches),
             )
+        # MemFabric reads require registered local destinations. The ingress
+        # page is shared across layers; indexer views can also share storage.
+        regions = collect_storage_merged_register_regions(
+            {
+                "ingress": (self._avsg_ingress.kv_rows, self._avsg_ingress.rope_rows),
+                "indexer": self._indexer_tensors,
+                "indexer_scale": self._indexer_scale_tensors,
+            }
+        )
+        validate_register_region_count(regions)
+        global_memfabric_te.register_buffer(regions.ptrs, regions.lengths)
+        logger.info(
+            "SFAPDRD2H D-side AVSG ingress: %d layers, %d tokens of main-KV staging, "
+            "%d MemFabric destination regions (%d bytes)",
+            len(layers),
+            block_tokens,
+            len(regions.ptrs),
+            regions.registered_bytes,
+        )
         self._start_memfabric_read_thread()
-        logger.info("SFAPDRD2H D-side AVSG ingress: %d layers, %d tokens of main-KV staging", len(layers), block_tokens)
 
     def _register_memfabric_pull(
         self,

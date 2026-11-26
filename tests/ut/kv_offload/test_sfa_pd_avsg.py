@@ -171,7 +171,7 @@ def test_invalid_main_page_table_is_rejected_before_submission(ingress, source, 
 
 
 @pytest.fixture
-def consumer(monkeypatch):
+def consumer(monkeypatch, request):
     peer, engine = _Peer(), _MemoryCopyEngine()
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_rank=0),
@@ -198,19 +198,44 @@ def consumer(monkeypatch):
         worker.engine = engine
         return engine
 
+    register_buffer = Mock()
+    monkeypatch.setattr(f"{module}.global_memfabric_te.register_buffer", register_buffer)
+
     def start_reader():
+        register_buffer.assert_called_once()
         worker._mf_read_thread = MembPullReadThread(0, 24000, engine, worker._build_consumer_read_state())
 
     monkeypatch.setattr(worker, "_ensure_engine", ensure_engine)
     monkeypatch.setattr(worker, "_start_memfabric_read_thread", start_reader)
     caches = {name: (torch.empty(0), torch.empty(0)) for name in LAYER_NAMES}
     caches.update({f"{name}.indexer": (torch.zeros(NUM_BLOCKS, 2, 3),) for name in LAYER_NAMES})
+    if getattr(request, "param", None) == "shared_indexer_with_scale":
+        # Two logical indexer layers alias the same sliced allocation. Scale
+        # is a distinct view of the same storage, immediately following it.
+        raw = torch.zeros(2 * NUM_BLOCKS + 1, 2)
+        pages = (raw[1 : NUM_BLOCKS + 1], raw[NUM_BLOCKS + 1 :])
+        for name in LAYER_NAMES:
+            caches[f"{name}.indexer"] = pages
     worker._register_avsg_memfabric_pull(caches)
+    engine.registered_regions = list(zip(*register_buffer.call_args.args))
     metadata = SfaPDConsumerMetadata()
     metadata.add_request("request", [5, 1, 6], [2, 4, 7])
     worker.start_load_kv(metadata)
     yield worker, peer, engine, caches
     worker.shutdown()
+
+
+@pytest.mark.parametrize("consumer", ["shared_indexer_with_scale"], indirect=True)
+def test_registers_only_ingress_and_indexer_dma_destinations(consumer):
+    worker, _, engine, caches = consumer
+    ingress = worker._avsg_ingress
+    indexer, scale = caches[f"{LAYER_NAMES[0]}.indexer"]
+    assert len(engine.registered_regions) == 3
+    assert set(engine.registered_regions) == {
+        (ingress.kv_rows.data_ptr(), ingress.kv_rows.nbytes),
+        (ingress.rope_rows.data_ptr(), ingress.rope_rows.nbytes),
+        (indexer.data_ptr(), indexer.nbytes + scale.nbytes),
+    }
 
 
 def _p_metadata(kv, rope, indexer):
