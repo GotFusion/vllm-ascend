@@ -60,6 +60,14 @@ entry point with the updated server configuration, then start P/D as before.
 The peer publishes its HIXL manifest before waiting for HCOMM initialization.
 Do not reuse a manifest from an earlier process.
 
+Add `--shutdown-timeout 60` to both `vllm serve` commands. To stop the services,
+signal each top-level API process and wait for its EngineCore to finish before
+stopping the peer. Do not signal all child processes at the same time. vLLM
+0.30 defaults to a zero-second shutdown wait and can kill EngineCore before
+`Worker.shutdown()` closes the gather session. An unexpected control-socket
+EOF remains an error; the peer must not treat a crashed client as a successful
+protocol close.
+
 The backend is selected only when `kvgather` is present in the endpoint. Without
 that section, the original AVSG HIXL gather is unchanged. GLM-5.3 validation
 keeps real first-five-layer weights, MTP0, eager, PD TP1, BF16 KV/indexer and
