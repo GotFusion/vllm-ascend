@@ -44,6 +44,7 @@ class AscBuild(build_ext):
 setup(
     name="ascend-kv-gather",
     version="0.1.0",
+    license_files=["vendor/ascend-kv-gather/LICENSE"],
     packages=find_packages(),
     python_requires=">=3.10",
     ext_modules=[Extension("ascend_kv_gather.libascend_kv_gather", sources=[])],
