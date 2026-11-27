@@ -1,0 +1,13 @@
+{
+  "project": "ascend-kv-gather",
+  "revision": "ccf40dc635230e91fc2464d74c9d3b25433db579",
+  "files": {
+    "LICENSE": "05205a02acebd671c78d3b876c1f6097b84cce89780f5d9bdc204bfbea92d0c1",
+    "SOURCES.md": "ed03e0a7a2d97a9dd8fbf73cdda62ad3fc2b696cc07caacf14b5272271300f29",
+    "aiv/main.asc": "220f66f9adc24620e3e2f01766b92df1ed1a0b9cc83b3d72ed8db8036003460c",
+    "aiv/protocol.h": "cd81a6edb38091b02ddfd59d2cb8130252573da147cda07a1a29b61d0a087939",
+    "aiv/transfer.cpp": "d926c9311f22694b754b1a75b0682990023470fff64f8dd416f6c126a7b295ab",
+    "aiv/vector_builder.h": "440fc94b2c21bedc3f4e2af5c6aefb1d8c48087835f05af30c5dc31c2284c265",
+    "tests/vector_builder_test.cc": "6ed547f9aaab663deb9526434feb2c0b685837e5c6e66c0583ecba4e10023238"
+  }
+}

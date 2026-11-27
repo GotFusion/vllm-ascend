@@ -43,6 +43,16 @@ class AvsgTransport:
             for layout in remote.values()
         ):
             raise ValueError("AVSG remote manifest must match the GLM layers, cache dtype and page layout")
+        kvgather_options = None
+        if "kvgather" in endpoint:
+            # Import only inside an NPU worker that explicitly selected this
+            # backend. Missing binaries or a failed connection must not silently
+            # fall back to the original HIXL READ implementation.
+            from ascend_kv_gather import KVGatherClient, parse_endpoint
+
+            kvgather_options = parse_endpoint(endpoint["kvgather"], path.parent)
+            if (kv_dim, rope_dim, dtype) != (512, 64, torch.bfloat16):
+                raise ValueError("KV gather requires BF16 GLM KV512 and RoPE64 caches")
         self._remote_blocks = {layer: layout.blocks for layer, layout in remote.items()}
         self._block_size = block_size
         self._max_tokens = max_tokens
@@ -65,7 +75,10 @@ class AvsgTransport:
         )
         self._reads = {}
         self._writes = {}
+        self._gather_client = None
         self._closed = False
+        self._gather_closed = False
+        self._hixl_closed = False
         self._session = AvsgUrmaSession(
             local_engine=endpoint["local_engine"],
             device=device.index,
@@ -75,26 +88,42 @@ class AvsgTransport:
         try:
             # Register each local allocation once. Each context then pairs that
             # allocation with a different layer's remote base addresses.
-            _, _, self._source_kv, self._source_rope = self._session.bind_staging(
+            self._selection_kv, self._selection_rope, self._source_kv, self._source_rope = self._session.bind_staging(
                 0, "step", kv_buffer, rope_buffer, selection_blocks
             )
             self._session.connect(endpoint["peer_engine"], timeout_ms=endpoint.get("timeout_ms", 30000))
             for layer, layout in remote.items():
                 self._session.prepare_layer(0, layout)
-                self._reads[layer] = self._session.prepare_graph_copy(
-                    layer_id=0, mapping_capacity=AVSG_SELECTION_TOKENS, workspace=workspace
-                )
+                if kvgather_options is None:
+                    self._reads[layer] = self._session.prepare_graph_copy(
+                        layer_id=0, mapping_capacity=AVSG_SELECTION_TOKENS, workspace=workspace
+                    )
                 self._writes[layer] = self._session.prepare_graph_write(
                     layer_id=0, source="step", mapping_capacity=max_tokens, workspace=workspace
+                )
+            if kvgather_options is not None:
+                self._gather_client = KVGatherClient(
+                    self._selection_kv,
+                    self._selection_rope,
+                    device=device.index,
+                    layer_ids=list(remote),
+                    layer_layouts={str(layer): manifest[str(layer)] for layer in remote},
+                    **kvgather_options,
                 )
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
-        if not self._closed:
-            self._session.close()
-            self._closed = True
+        self._closed = True
+        try:
+            if self._gather_client is not None and not self._gather_closed:
+                self._gather_client.close()
+                self._gather_closed = True
+        finally:
+            if not self._hixl_closed:
+                self._session.close()
+                self._hixl_closed = True
 
     @property
     def block_size(self) -> int:
@@ -193,10 +222,13 @@ class AvsgTransport:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._closed:
             raise RuntimeError("AVSG transport is closed")
-        rope, kv, context, scratch, seen, status = self._reads[layer_id]
         try:
-            torch.ops.avsg_urma.copy_graph_(rope, kv, q_lens, mapping, counts, context, scratch, seen, status, None)
-            self._session.check_graph_copy(status)
+            if self._gather_client is not None:
+                kv, rope = self._gather_client.gather(layer_id, q_lens, mapping, counts)
+            else:
+                rope, kv, context, scratch, seen, status = self._reads[layer_id]
+                torch.ops.avsg_urma.copy_graph_(rope, kv, q_lens, mapping, counts, context, scratch, seen, status, None)
+                self._session.check_graph_copy(status)
         except Exception:
             self.close()
             raise

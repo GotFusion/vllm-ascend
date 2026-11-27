@@ -22,6 +22,7 @@ repos:
   rev: v2.4.1
   hooks:
     - id: codespell
+      exclude: ^csrc/ascend_kv_gather/vendor/
       args: [
         --toml, pyproject.toml,
         '--skip', 'tests/prompts/**,./benchmarks/sonnet.txt,*tests/lora/data/**,build/**,./vllm_ascend.egg-info/**,typos.toml',
@@ -52,7 +53,7 @@ repos:
   hooks:
   - id: markdownlint
     args: ['--fix']
-    exclude: '^csrc/avsg_urma/|.*\.inc\.md$|.*report_template\.md$|.*contributors\.md$|.*PULL_REQUEST_TEMPLATE\.md$'
+    exclude: '^csrc/avsg_urma/|^csrc/ascend_kv_gather/vendor/|.*\.inc\.md$|.*report_template\.md$|.*contributors\.md$|.*PULL_REQUEST_TEMPLATE\.md$'
     stages: [manual] # Only run in CI
 
 - repo: https://github.com/rhysd/actionlint

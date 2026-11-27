@@ -71,8 +71,10 @@ class MemoryPeer:
 
 
 @pytest.fixture
-def transport(tmp_path, monkeypatch):
+def transport(tmp_path, monkeypatch, request):
     peer = MemoryPeer()
+    use_kvgather = getattr(request, "param", False)
+    kv_dim, rope_dim, dtype = (512, 64, torch.bfloat16) if use_kvgather else (2, 1, torch.float16)
     # Load the vendored wire-format validator without importing its NPU extension.
     package = ModuleType("avsg_urma")
     monkeypatch.setitem(sys.modules, "avsg_urma", package)
@@ -87,23 +89,40 @@ def transport(tmp_path, monkeypatch):
     ops = torch.ops.avsg_urma
     monkeypatch.setattr(ops, "write_graph_", lambda *args: peer.transfer("write", *args), raising=False)
     monkeypatch.setattr(ops, "copy_graph_", lambda *args: peer.transfer("read", *args), raising=False)
+    if use_kvgather:
+        # This tests adapter ownership/routing only. Native HCOMM and Match
+        # prefix validation have separate package and two-card tests.
+        gather_package = ModuleType("ascend_kv_gather")
+        peer.gather_client = Mock()
+
+        def gather(layer, q_lens, mapping, counts):
+            kv, rope = peer.selection
+            status = torch.zeros(1)
+            peer.transfer("read", rope, kv, q_lens, mapping, counts, (layer + 1) * 8192, None, None, status)
+            peer.check(status)
+            return kv, rope
+
+        peer.gather_client.gather.side_effect = gather
+        peer.gather_factory = gather_package.KVGatherClient = Mock(return_value=peer.gather_client)
+        gather_package.parse_endpoint = lambda options, base_dir: options
+        monkeypatch.setitem(sys.modules, "ascend_kv_gather", gather_package)
     manifest = {}
     for layer in (0, 3):
         base = (layer + 1) * 8192
         manifest[str(layer)] = protocol.RemoteCache(
             kv_base=base,
-            kv_bytes=1024,
+            kv_bytes=256 * kv_dim * 2,
             blocks=2,
             block_size=128,
-            kv_dim=2,
-            kv_stride0=512,
-            kv_stride1=4,
-            dtype="float16",
+            kv_dim=kv_dim,
+            kv_stride0=128 * kv_dim * 2,
+            kv_stride1=kv_dim * 2,
+            dtype=str(dtype).removeprefix("torch."),
             rope_base=base + 2048,
-            rope_bytes=512,
-            rope_dim=1,
-            rope_stride0=256,
-            rope_stride1=2,
+            rope_bytes=256 * rope_dim * 2,
+            rope_dim=rope_dim,
+            rope_stride0=128 * rope_dim * 2,
+            rope_stride1=rope_dim * 2,
         ).to_dict()
     (tmp_path / "layers.json").write_text(json.dumps(manifest))
     (tmp_path / "rank2.json").write_text(
@@ -113,20 +132,28 @@ def transport(tmp_path, monkeypatch):
                 "peer_engine": "cache",
                 "local_comm_res": {},
                 "remote_manifest": "layers.json",
+                **({"kvgather": {"host": "localhost", "port": 19780}} if use_kvgather else {}),
             }
         )
     )
-    adapter = AvsgTransport(
-        endpoint_file=str(tmp_path / "rank{rank}.json"),
-        rank=2,
-        device=torch.device("cpu", 0),
-        layer_ids=[0, 3],
-        block_size=128,
-        kv_dim=2,
-        rope_dim=1,
-        max_tokens=4,
-        dtype=torch.float16,
-    )
+
+    def create_adapter(**overrides):
+        kwargs = dict(
+            endpoint_file=str(tmp_path / "rank{rank}.json"),
+            rank=2,
+            device=torch.device("cpu", 0),
+            layer_ids=[0, 3],
+            block_size=128,
+            kv_dim=kv_dim,
+            rope_dim=rope_dim,
+            max_tokens=4,
+            dtype=dtype,
+        )
+        kwargs.update(overrides)
+        return AvsgTransport(**kwargs)
+
+    peer.create_adapter = create_adapter
+    adapter = create_adapter()
     yield adapter, peer
     adapter.close()
 
@@ -267,3 +294,92 @@ def test_pd_rejects_layout_mismatch(transport):
     with pytest.raises(ValueError, match="no layer"):
         adapter.publish_received(1, kv.flatten(0, 2)[:8], rope.flatten(0, 2)[:8], torch.arange(8))
     peer.session.check_graph_copy.assert_not_called()
+
+
+@pytest.mark.parametrize("transport", [True], indirect=True)
+def test_kvgather_keeps_hixl_publish_and_bounded_selection(transport, monkeypatch):
+    adapter, peer = transport
+    original_read = Mock(side_effect=AssertionError("KV gather must not use the HIXL READ kernel"))
+    monkeypatch.setattr(torch.ops.avsg_urma, "copy_graph_", original_read)
+    source_kv, source_rope = adapter.staging_cache
+    source_kv.flatten(0, 2)[:3].fill_(11)
+    source_rope.flatten(0, 2)[:3].fill_(19)
+    adapter.publish_staged(3, torch.tensor([255, -1, 129]))
+    pairs = torch.tensor([[[[255, 7], [129, 131], [-1, -1]]]], dtype=torch.int32)
+    selected_kv, selected_rope = adapter.gather(
+        3, torch.tensor([1], dtype=torch.int32), pairs, torch.tensor([[2]], dtype=torch.int32)
+    )
+    assert selected_kv.shape == (64, 128, 1, 512)
+    assert selected_rope.shape == (64, 128, 1, 64)
+    assert source_kv.shape == (1, 128, 1, 512)
+    assert source_rope.shape == (1, 128, 1, 64)
+    assert torch.all(selected_kv.flatten(0, 2)[[7, 131]] == 11)
+    assert torch.all(selected_rope.flatten(0, 2)[[7, 131]] == 19)
+    peer.session.check_graph_copy.assert_called_once()  # HIXL WRITE only.
+    peer.session.prepare_graph_copy.assert_not_called()
+    original_read.assert_not_called()
+    options = peer.gather_factory.call_args.kwargs
+    assert options["host"] == "localhost" and options["port"] == 19780
+    assert options["layer_ids"] == [0, 3]
+    assert options["layer_layouts"]["3"]["kv_base"] == 32768
+    assert peer.gather_factory.call_args.args[0] is peer.selection[0]
+
+
+@pytest.mark.parametrize("transport", [True], indirect=True)
+def test_kvgather_pd_ingress_keeps_hixl_write_order(transport):
+    adapter, peer = transport
+    kv = torch.full((9, 512), 5, dtype=torch.bfloat16)
+    rope = torch.full((9, 64), 7, dtype=torch.bfloat16)
+    slots = torch.arange(200, 209)
+    adapter.publish_received(0, kv, rope, slots)
+    assert peer.session.check_graph_copy.call_count == 3
+    peer.gather_client.gather.assert_not_called()
+    for received, expected in zip(peer.rows[8192], (kv, rope)):
+        torch.testing.assert_close(received[slots], expected.float())
+
+
+@pytest.mark.parametrize("transport", [True], indirect=True)
+def test_kvgather_failure_poison_transport_without_fallback(transport, monkeypatch):
+    adapter, peer = transport
+    fallback = Mock()
+    monkeypatch.setattr(torch.ops.avsg_urma, "copy_graph_", fallback)
+    peer.gather_client.gather.side_effect = RuntimeError("HCOMM completion failed")
+    with pytest.raises(RuntimeError, match="HCOMM completion"):
+        adapter.gather(
+            0,
+            torch.ones(1, dtype=torch.int32),
+            torch.zeros((1, 1, 1, 2), dtype=torch.int32),
+            torch.ones((1, 1), dtype=torch.int32),
+        )
+    peer.gather_client.close.assert_called_once()
+    peer.session.close.assert_called_once()
+    fallback.assert_not_called()
+    with pytest.raises(RuntimeError, match="closed"):
+        adapter.publish_staged(0, torch.zeros(1, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("transport", [True], indirect=True)
+def test_kvgather_initialization_failure_closes_hixl(transport):
+    adapter, peer = transport
+    adapter.close()
+    peer.session.close.reset_mock()
+    peer.gather_factory.side_effect = RuntimeError("HCOMM bootstrap failed")
+    with pytest.raises(RuntimeError, match="HCOMM bootstrap"):
+        peer.create_adapter()
+    peer.session.close.assert_called_once()
+
+
+@pytest.mark.parametrize("transport", [True], indirect=True)
+def test_kvgather_close_error_still_closes_hixl_and_can_retry_cleanup(transport):
+    adapter, peer = transport
+    peer.gather_client.close.side_effect = RuntimeError("HCOMM destroy failed")
+    with pytest.raises(RuntimeError, match="HCOMM destroy"):
+        adapter.close()
+    peer.session.close.assert_called_once()
+    with pytest.raises(RuntimeError, match="closed"):
+        adapter.publish_staged(0, torch.zeros(1, dtype=torch.int32))
+    peer.gather_client.close.side_effect = None
+    adapter.close()
+    adapter.close()
+    assert peer.gather_client.close.call_count == 2
+    peer.session.close.assert_called_once()

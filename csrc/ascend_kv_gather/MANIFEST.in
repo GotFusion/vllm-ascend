@@ -1,0 +1,4 @@
+include CMakeLists.txt
+include SOURCE_MANIFEST.json
+recursive-include native *.h *.asc
+recursive-include vendor *
