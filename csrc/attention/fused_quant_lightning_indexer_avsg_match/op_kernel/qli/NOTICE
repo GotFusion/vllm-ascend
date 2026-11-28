@@ -1,0 +1,9 @@
+The files in this directory are the Ascend 950 QuantLightningIndexer V1 device
+implementation and the LightningIndexer and LightningIndexerV2 headers it includes.
+Their paths below this directory match the source repository's attention/ tree.
+
+Source: https://gitcode.com/cann/ops-transformer
+Revision: 2f48ccfb080441053459f6979d3ce87f808bbcf2
+License: CANN Open Software License Agreement Version 2.0 (../../LICENSE).
+
+The upstream source files and their original notices are reproduced verbatim.

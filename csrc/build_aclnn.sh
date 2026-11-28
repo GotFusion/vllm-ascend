@@ -197,6 +197,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
+        "fused_quant_lightning_indexer_avsg_match"
         "sparse_flash_attention_vllm"
         "chunk_gated_delta_rule_fwd_h_vllm"
         "scatter_nd_update_sk"

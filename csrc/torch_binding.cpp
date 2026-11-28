@@ -49,6 +49,7 @@
 #include "attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h"
 #include "attention/fused_scatter_copy_sparse_flash_attention/fused_scatter_copy_sparse_flash_attention_torch_adpt.h"
 #include "attention/fused_quant_lightning_indexer_manage/fused_quant_lightning_indexer_manage_torch_adpt.h"
+#include "attention/fused_quant_lightning_indexer_avsg_match/fused_quant_lightning_indexer_avsg_match_torch_adpt.h"
 #include "attention/indexer_region_score/indexer_region_score_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/attn_res_fwd/attn_res_fwd_torch_adpt.h"
@@ -2968,6 +2969,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+    ops.def("npu_fused_quant_lightning_indexer_avsg_match(Tensor query, Tensor key, Tensor weights, "
+            "Tensor query_dequant_scale, Tensor key_dequant_scale, Tensor actual_seq_lengths_query, "
+            "Tensor actual_seq_lengths_key, Tensor block_table, Tensor hot_block_table, Tensor(a!) status) "
+            "-> (Tensor slots, Tensor hits, Tensor mapping, Tensor counts)");
+    ops.impl("npu_fused_quant_lightning_indexer_avsg_match", torch::kPrivateUse1,
+             &vllm_ascend::avsg::fused_quant_lightning_indexer_avsg_match);
+    ops.impl("npu_fused_quant_lightning_indexer_avsg_match", torch::kMeta,
+             &vllm_ascend::avsg::prepare_avsg_match_outputs);
+
     ops.def("hisparse_resolve_residency(Tensor logical, Tensor hot_table, Tensor? requests, Tensor? states, Tensor? source, "
             "Tensor? resident, Tensor? valid_rows, Tensor(a!) dgi, Tensor(a!) lru, Tensor(a!) output, "
             "Tensor(a!) resolved, Tensor(a!) errors, Tensor(a!)? attention, Tensor(a!)? counts, "
