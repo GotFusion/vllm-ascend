@@ -6,4 +6,6 @@ Source: https://gitcode.com/cann/ops-transformer
 Revision: 2f48ccfb080441053459f6979d3ce87f808bbcf2
 License: CANN Open Software License Agreement Version 2.0 (../../LICENSE).
 
-The upstream source files and their original notices are reproduced verbatim.
+Two internal C++ identifiers in lightning_indexer_v2_topk_base.h and
+lightning_indexer_v2_vector1_base.h use the local names IndexType and allOnes.
+The source copyright and license notices are preserved.

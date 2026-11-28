@@ -44,7 +44,7 @@ struct UIntSortConstCtx {
     using Traits = UIntSortTraits<FloatT>;
     using UInt = typename Traits::UInt;
     AscendC::Reg::RegTensor<UInt> zeros;
-    AscendC::Reg::RegTensor<UInt> allOne;
+    AscendC::Reg::RegTensor<UInt> allOnes;
     AscendC::Reg::RegTensor<UInt> signMask;
     AscendC::Reg::RegTensor<UInt> nan;
 };
@@ -54,7 +54,7 @@ __simd_callee__ inline void InitUIntSortConstCtx(UIntSortConstCtx<FloatT> &ctx, 
 {
     using Traits = UIntSortTraits<FloatT>;
     AscendC::Reg::Duplicate(ctx.zeros, Traits::ZERO, maskAll);
-    AscendC::Reg::Duplicate(ctx.allOne, Traits::ALL_ONE, maskAll);
+    AscendC::Reg::Duplicate(ctx.allOnes, Traits::ALL_ONE, maskAll);
     AscendC::Reg::Duplicate(ctx.signMask, Traits::SIGN_MASK, maskAll);
     AscendC::Reg::Duplicate(ctx.nan, Traits::NAN_MASK, maskAll);
 }
@@ -86,7 +86,7 @@ __simd_callee__ inline void UIntToSortableKey(AscendC::Reg::RegTensor<FloatT> &o
     AscendC::Reg::Compare<UInt, CMPMODE::GT>(regSelectSign, regTemp, ctx.zeros, maskAll);
 
     // 4. xor mask
-    AscendC::Reg::Select(regMask, ctx.signMask, ctx.allOne, regSelectSign);
+    AscendC::Reg::Select(regMask, ctx.signMask, ctx.allOnes, regSelectSign);
     AscendC::Reg::Xor((AscendC::Reg::RegTensor<UInt> &)outKey, (AscendC::Reg::RegTensor<UInt> &)outKey, regMask,
                       maskAll);
 }
@@ -119,7 +119,7 @@ struct FloatSortConstCtx {
     using Traits = FloatSortTraits<FloatT>;
     using UInt = typename Traits::UInt;
     AscendC::Reg::RegTensor<UInt> zeros;
-    AscendC::Reg::RegTensor<UInt> allOne;
+    AscendC::Reg::RegTensor<UInt> allOnes;
     AscendC::Reg::RegTensor<UInt> signMask;
     AscendC::Reg::RegTensor<UInt> nan;
 };
@@ -129,7 +129,7 @@ __simd_callee__ inline void InitFloatSortConstCtx(FloatSortConstCtx<FloatT> &ctx
 {
     using Traits = FloatSortTraits<FloatT>;
     AscendC::Reg::Duplicate(ctx.zeros, Traits::ZERO, maskAll);
-    AscendC::Reg::Duplicate(ctx.allOne, Traits::ALL_ONE, maskAll);
+    AscendC::Reg::Duplicate(ctx.allOnes, Traits::ALL_ONE, maskAll);
     AscendC::Reg::Duplicate(ctx.signMask, Traits::SIGN_MASK, maskAll);
     AscendC::Reg::Duplicate(ctx.nan, Traits::NAN_MASK, maskAll);
 }
@@ -153,7 +153,7 @@ __simd_callee__ inline void FloatToSortableKey(Reg::RegTensor<typename FloatSort
     AscendC::Reg::Compare<UInt, CMPMODE::EQ>(regSelectNan, inBits, ctx.nan, maskAll);
 
     // 2. NaN -> ALL_ONE
-    AscendC::Reg::Select(outKey, ctx.allOne, inBits, regSelectNan);
+    AscendC::Reg::Select(outKey, ctx.allOnes, inBits, regSelectNan);
 
     // 3. sign bit
     AscendC::Reg::And(regTemp, outKey, ctx.signMask, maskAll);
@@ -161,7 +161,7 @@ __simd_callee__ inline void FloatToSortableKey(Reg::RegTensor<typename FloatSort
     AscendC::Reg::Compare<UInt, CMPMODE::GT>(regSelectSign, regTemp, ctx.zeros, maskAll);
 
     // 4. xor mask
-    AscendC::Reg::Select(regMask, ctx.allOne, ctx.signMask, regSelectSign);
+    AscendC::Reg::Select(regMask, ctx.allOnes, ctx.signMask, regSelectSign);
     AscendC::Reg::Xor(outKey, outKey, regMask, maskAll);
 }
 
@@ -187,8 +187,8 @@ __simd_callee__ inline void FloatX2ToSortableKey(Reg::RegTensor<typename FloatSo
     AscendC::Reg::Compare<UInt, CMPMODE::EQ>(regSelectNan[1], inBits1, ctx.nan, maskAll);
 
     // 2. NaN -> ALL_ONE
-    AscendC::Reg::Select(outKey0, ctx.allOne, inBits0, regSelectNan[0]);
-    AscendC::Reg::Select(outKey1, ctx.allOne, inBits1, regSelectNan[1]);
+    AscendC::Reg::Select(outKey0, ctx.allOnes, inBits0, regSelectNan[0]);
+    AscendC::Reg::Select(outKey1, ctx.allOnes, inBits1, regSelectNan[1]);
 
     // 3. sign bit
     AscendC::Reg::And(regTemp[0], outKey0, ctx.signMask, maskAll);
@@ -198,8 +198,8 @@ __simd_callee__ inline void FloatX2ToSortableKey(Reg::RegTensor<typename FloatSo
     AscendC::Reg::Compare<UInt, CMPMODE::GT>(regSelectSign[1], regTemp[1], ctx.zeros, maskAll);
 
     // 4. xor mask
-    AscendC::Reg::Select(regMask[0], ctx.allOne, ctx.signMask, regSelectSign[0]);
-    AscendC::Reg::Select(regMask[1], ctx.allOne, ctx.signMask, regSelectSign[1]);
+    AscendC::Reg::Select(regMask[0], ctx.allOnes, ctx.signMask, regSelectSign[0]);
+    AscendC::Reg::Select(regMask[1], ctx.allOnes, ctx.signMask, regSelectSign[1]);
     AscendC::Reg::Xor(outKey0, outKey0, regMask[0], maskAll);
     AscendC::Reg::Xor(outKey1, outKey1, regMask[1], maskAll);
 }
