@@ -13,6 +13,7 @@
 #define AVSG_MATCH_SPLIT_BS_REUSE_VEC_H
 
 #include "kernel_operator.h"
+#include "avsg_match_vector.h"
 #include <cstdint>
 
 namespace AvsgMatchNs {
@@ -72,18 +73,19 @@ private:
 class AvsgMatchSplitBsReuseVec
 {
 public:
-    __aicore__ inline AvsgMatchSplitBsReuseVec(TPipe* pipe, const AvsgMatchTilingData* tiling)
-        : pipe_(pipe), tiling_(tiling)
+    __aicore__ inline AvsgMatchSplitBsReuseVec(TPipe* pipe, const AvsgMatchTilingData* tiling,
+                                          avsg_fusion::LocalTopkRow* localRow)
+        : pipe_(pipe), tiling_(tiling), localRow_(localRow)
     {}
 
     __aicore__ inline void Init(
         GM_ADDR selection_kv_block_table, GM_ADDR selection_kv_block_status, GM_ADDR selection_kv_block_status_out,
         GM_ADDR selection_topk_indices,
         GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq, GM_ADDR full_q_actual_seq,
-        GM_ADDR selection_kv_actual_seq, GM_ADDR stage_two_copy_mapping, GM_ADDR stage_two_copy_count)
+        GM_ADDR selection_kv_actual_seq, GM_ADDR stage_two_copy_mapping, GM_ADDR stage_two_copy_count, uint32_t worker)
     {
 
-        blkIdx_ = GetBlockIdx();
+        blkIdx_ = worker;
         if (blkIdx_ >= tiling_->stageOneUsedCoreNum) {
             return;
         }
@@ -95,7 +97,9 @@ public:
         selTopKIdxUb_ = CeilAlign(
             static_cast<int64_t>(tiling_->topk * sizeof(int32_t)),
             static_cast<int64_t>(UB_BLOCK_ALIGN_BYTES));
-        pipe_->InitBuffer(selTopKIdxQue_, 1, selTopKIdxUb_);
+        if (localRow_ == nullptr) {
+            pipe_->InitBuffer(selTopKIdxQue_, 1, selTopKIdxUb_);
+        }
 
         selKvActSeqUb_ = CeilAlign(static_cast<int64_t>(stageOneLoopNum_ * sizeof(int32_t)), static_cast<int64_t>(UB_BLOCK_ALIGN_BYTES));
         // One batch of status: [statesize, 2] int32 words.
@@ -109,7 +113,11 @@ public:
         int64_t totalUb = CeilAlign(static_cast<int64_t> (tiling_->ubSize - UB_BLOCK_ALIGN_BYTES), static_cast<int64_t>(UB_BLOCK_ALIGN_BYTES));
         tmpbuffUb_ = CeilAlign(static_cast<int64_t>(totalUb - selTopKIdxUb_ - selKvActSeqUb_), static_cast<int64_t>(UB_BLOCK_ALIGN_BYTES)); // Bytes
 
-        pipe_->InitBuffer(workBuf_, selKvActSeqUb_ + tmpbuffUb_); // Per-core sequence output followed by reusable status and scratch buffers.
+        if (localRow_ != nullptr) {
+            localRow_->scratch.InitBuffer(workBuf_, selKvActSeqUb_ + tmpbuffUb_);
+        } else {
+            pipe_->InitBuffer(workBuf_, selKvActSeqUb_ + tmpbuffUb_);
+        }
 
         // For GM_Address
         // [batchsize, statesize * 2], initialized to -1 for an empty cache.
@@ -328,8 +336,11 @@ private:
         return fullQActualSeqGm_.GetValue(bsIdx);
     }
 
-    __aicore__ inline void CopyInTopKIndices(int64_t globalOffset)
+    __aicore__ inline LocalTensor<int32_t> AcquireTopKIndices(int64_t globalOffset)
     {
+        if (localRow_ != nullptr) {
+            return localRow_->tokens;
+        }
         int64_t gmOffset = globalOffset * tiling_->topk;
         LocalTensor<int32_t> selTopKIdxLocal = selTopKIdxQue_.AllocTensor<int32_t>();
         DataCopyPadExtParams<int32_t> dataCopyPadParams{false, 0, 0, 0};
@@ -337,6 +348,14 @@ private:
             static_cast<uint16_t>(1), static_cast<uint32_t>(tiling_->topk * sizeof(int32_t)), 0, 0, 0};
         DataCopyPad(selTopKIdxLocal, selTopKIndicesGm_[gmOffset], dataCopyParams, dataCopyPadParams);
         selTopKIdxQue_.EnQue(selTopKIdxLocal);
+        return selTopKIdxQue_.DeQue<int32_t>();
+    }
+
+    __aicore__ inline void ReleaseTopKIndices(LocalTensor<int32_t>& ids)
+    {
+        if (localRow_ == nullptr) {
+            selTopKIdxQue_.FreeTensor(ids);
+        }
     }
 
     __aicore__ inline void CopyInBlockStatus(int64_t loopIdx, LocalTensor<int32_t>& selBlockStatLocal)
@@ -606,8 +625,7 @@ private:
         for(int32_t seqId = 0; seqId < numSeqs; seqId++){
             TempBufferCursor chunkCursor = cursor.Fork();
             int32_t globalIndex = (globalTOffset+seqId) * tiling_->headnum;
-            CopyInTopKIndices(globalIndex);
-            LocalTensor<int32_t> selTopKIdLocal = selTopKIdxQue_.DeQue<int32_t>();
+            LocalTensor<int32_t> selTopKIdLocal = AcquireTopKIndices(globalIndex);
 
             LocalTensor<uint8_t> matchMask = chunkCursor.Alloc<uint8_t>(tiling_->topk);
 
@@ -623,7 +641,7 @@ private:
             ExtractTopkIndex(matchTopkIdx, matchTopkIdx,
                 chunkCursor.Fork(), validNum);
             RefreshRecord(matchTopkIdx, hashMapping, chunkCursor.Fork(), static_cast<int32_t>(MAX_RECORD_LIFETIME), validNum);
-            selTopKIdxQue_.FreeTensor(selTopKIdLocal);
+            ReleaseTopKIndices(selTopKIdLocal);
         }
 
     }
@@ -653,41 +671,11 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void DecrementRecordCounters(LocalTensor<int32_t>& statusLocal, TempBufferCursor cursor, int32_t decayValue, int64_t totalNum){
-        int64_t chunkNum = totalNum/chunkSize_;
-        for(int64_t chunkId = 0; chunkId < chunkNum; chunkId++){
-            DecrementRecordCountersPerChunk(statusLocal, cursor.Fork(), decayValue, chunkId, chunkSize_);
-        }
-    }
-
-    __aicore__ inline void DecrementRecordCountersPerChunk(LocalTensor<int32_t>& statusLocal, TempBufferCursor cursor, int32_t decayValue, int64_t chunkId, int64_t totalNum){
-
-        uint64_t stride = sizeof(int64_t) / sizeof(int32_t);
-        totalNum *= stride;
-        LocalTensor<int32_t> result = statusLocal[chunkId * totalNum];
-        LocalTensor<int32_t> value = cursor.Alloc<int32_t>(totalNum);
-        LocalTensor<int32_t> record = cursor.Alloc<int32_t>(totalNum);
-        AscendC::PipeBarrier<PIPE_ALL>();
-        ArithProgression<int32_t>(value, 0, 1, totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-        BitwiseModPowerOfTwo(value, HASH_ENTRY_FIELDS, cursor.Fork(), totalNum); // 0,1,0,1,0,1,0,1,0,1,0,1,0,1,.....,0,1
-
-        AscendC::Adds(value, value, -1, totalNum); // -1,0 selects cache words only
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(value, value, -decayValue, totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        ExtractRecord(record, result, totalNum);
-        StripRecord(result, result, totalNum);
-
-        AscendC::Sub(record, record, value, totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Maxs(record, record, INVALID_SLOT-1, totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        PackEntry(result, record, totalNum);
-
+    __aicore__ inline void DecrementRecordCounters(LocalTensor<int32_t>& state, int64_t slots)
+    {
+        PipeBarrier<PIPE_V>();
+        DecayAvsgRecords((__ubuf__ int32_t*)state.GetPhyAddr(), static_cast<uint16_t>(slots / AVSG_RECORD_LANES));
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void InterleaveTensors(LocalTensor<int32_t>& result, LocalTensor<int32_t>& topkId, LocalTensor<int32_t>& emptyIdx, TempBufferCursor cursor, uint64_t uniqueNum, uint64_t totalNum){
@@ -801,7 +789,7 @@ private:
             PipeBarrier<PIPE_V>();
             GatherByBitMask(tmpBuf, emptyMask, records, emptyNum, totalNum);
 
-            if (emptyNum < requiredNum) DecrementRecordCounters(statusLocal, cursor.Fork(), 1, totalNum);
+            if (emptyNum < requiredNum) DecrementRecordCounters(statusLocal, totalNum);
         }
 
         AscendC::Adds(result, tmpBuf, 0, requiredNum);
@@ -898,44 +886,12 @@ private:
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
 
-    __aicore__ inline void clearMtpToken(LocalTensor<int32_t>& statusLocal, int64_t curReqKvLength, TempBufferCursor cursor, int64_t totalNum){
-
-        int32_t chunkSize = chunkSize_;
-        int64_t chunkNum = totalNum/chunkSize;
-
-        for(int64_t chunkId = 0; chunkId < chunkNum; chunkId++){
-            LocalTensor<int32_t> tensor = statusLocal[chunkId * chunkSize * HASH_ENTRY_FIELDS];
-            clearMtpTokenPerChunk(tensor, curReqKvLength, cursor.Fork(), chunkSize);
-        }
-    }
-    __aicore__ inline void clearMtpTokenPerChunk(LocalTensor<int32_t>& statusLocal, int64_t curReqKvLength, TempBufferCursor cursor, int64_t totalNum){
-        LocalTensor<int32_t> topkId = cursor.Alloc<int32_t>(totalNum);
-        LocalTensor<int32_t> topkIdx = cursor.Alloc<int32_t>(totalNum);
-
-        PipeBarrier<PIPE_ALL>();
-        AscendC::CreateVecIndex(topkId, 0, totalNum);
+    __aicore__ inline void ClearMtpTokens(LocalTensor<int32_t>& state, int32_t firstInvalid, int64_t slots)
+    {
         PipeBarrier<PIPE_V>();
-
-        GatherRecordIndexFromHash(topkIdx, topkId, statusLocal, cursor.Fork(), totalNum);
-        GatherPackedTokenFromHash(topkId, topkId, statusLocal, cursor.Fork(), totalNum);
-        DecodeTokenId(statusLocal, topkId, totalNum);
-        AscendC::Adds(statusLocal, statusLocal, static_cast<int32_t>(-curReqKvLength), totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        TempBufferCursor tmpCursor = cursor.Fork();
-        LocalTensor<uint8_t> tmpMask = cursor.Alloc<uint8_t>(totalNum);
-        isNegative(tmpMask, statusLocal, cursor.Fork(), true, totalNum);
-
-        // Keep valid packed tokens. Clear MTP tokens to record=0, token=-1,
-        // matching the previous lifetime semantics without touching word1.
-        AscendC::Duplicate(statusLocal, HASH_INDEX_MASK, totalNum);
+        InvalidateAvsgTail((__ubuf__ int32_t*)state.GetPhyAddr(), static_cast<uint16_t>(slots / AVSG_RECORD_LANES),
+                           firstInvalid);
         PipeBarrier<PIPE_V>();
-        AscendC::Select(topkId.template ReinterpretCast<float>(), tmpMask,
-            topkId.template ReinterpretCast<float>(), statusLocal.template ReinterpretCast<float>(),
-            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, totalNum);
-        PipeBarrier<PIPE_V>();
-        InterleaveTensors(statusLocal, topkId, topkIdx, tmpCursor, totalNum, totalNum);
-
     }
 
     __aicore__ inline void StageOne(){
@@ -975,7 +931,7 @@ private:
             CopyInBlockStatus(loopIdx, statusLocal);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
 
-            DecrementRecordCounters(statusLocal, cursor.Fork(), 1, tiling_->statesize);
+            DecrementRecordCounters(statusLocal, tiling_->statesize);
 
             // A multi-query request must reserve hits in every row before the
             // first eviction. A single row can refresh its hits during lookup.
@@ -994,8 +950,7 @@ private:
                     TempBufferCursor seqCursor = cursor.Fork();
 
                     int32_t globalIndex = (tOffset + seqIdx) * tiling_->headnum + headIdx;
-                    CopyInTopKIndices(globalIndex);
-                    LocalTensor<int32_t> selTopKIdLocal = selTopKIdxQue_.DeQue<int32_t>();
+                    LocalTensor<int32_t> selTopKIdLocal = AcquireTopKIndices(globalIndex);
 
                     uint64_t mismatchNum = 0;
                     LocalTensor<uint8_t> mismatchMask = seqCursor.Alloc<uint8_t>(tiling_->topk);
@@ -1022,11 +977,11 @@ private:
                     SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
                     CopyOutTopKIndices(globalIndex, selTopKIdLocal);
                     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-                    selTopKIdxQue_.FreeTensor(selTopKIdLocal);
+                    ReleaseTopKIndices(selTopKIdLocal);
                 }
             }
             selKvActSeqLocal.SetValue(loopIdx, reusedNum);
-            clearMtpToken(statusLocal, curFullKvSeqModify+1, cursor.Fork(), tiling_->statesize);
+            ClearMtpTokens(statusLocal, curFullKvSeqModify + 1, tiling_->statesize);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             CopyOutState(loopIdx, statusLocal);
             SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
@@ -1081,6 +1036,7 @@ private:
 private:
     TPipe* pipe_;
     const AvsgMatchTilingData* tiling_;
+    avsg_fusion::LocalTopkRow* localRow_;
 
     // Stage One
     int32_t stageOneLoopNum_ = 0;
@@ -1092,7 +1048,6 @@ private:
     int32_t selKvActSeqUb_ = 0;
     int32_t tmpbuffUb_ = 0;
     int32_t offsetOutputUb_ = 0;
-    int32_t chunkSize_ = tiling_->topk;
     int32_t poolSize_ = tiling_->selMaxBlockNum * tiling_->selKvBlockSize;
 
     constexpr static int64_t HASH_ENTRY_FIELDS = 2;

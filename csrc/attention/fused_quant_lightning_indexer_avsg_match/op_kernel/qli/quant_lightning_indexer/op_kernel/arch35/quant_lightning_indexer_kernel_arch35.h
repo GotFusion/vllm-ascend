@@ -116,6 +116,8 @@ protected:
     uint32_t tmpBlockIdx = 0U;
     uint32_t aiCoreIdx = 0U;
     uint32_t usedCoreNum = 0U;
+    bool splitScores = false;
+    bool reduceScoreTile = false;
 
     QLICommon::ConstInfo constInfo{};
     TempLoopInfo tempLoopInfo{};
@@ -126,12 +128,14 @@ protected:
     __aicore__ inline void InitTilingData(const QLITilingData *__restrict tilingData);
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK);
     // ================================Split Core================================
+    __aicore__ inline bool TrySplitDecodeScores(uint32_t &scoreTile);
     __aicore__ inline void SplitCore(uint32_t curCoreIdx, uint32_t &coreNum, QLICommon::SplitCoreInfo &info);
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
-    __aicore__ inline void ProcessMain();
-    __aicore__ inline void ProcessBaseBlock(uint32_t qliLoop, uint64_t s2LoopIdx, QLICommon::RunInfo qliRunInfo,
+    __aicore__ inline void ProcessMain(QLICommon::RunInfo &runInfo);
+    __aicore__ inline void FreeEvents();
+    __aicore__ inline void ProcessBaseBlock(uint32_t qliLoop, uint64_t s2LoopIdx, QLICommon::RunInfo &qliRunInfo,
                                             uint32_t qliQScaleLoop, uint32_t qliKScaleLoop);
     __aicore__ inline void ProcessInvalid();
     // ================================Params Calc=====================================
@@ -340,6 +344,55 @@ __aicore__ void inline QuantLightningIndexerKernel<QLIT>::SplitCore(uint32_t cur
     }
 }
 
+// In decode, one or two queries can leave most cube groups idle. Stripe the
+// score computation across those cubes. Their vector workers write to disjoint,
+// page-aligned columns of one shared score tile. The first group for each tile
+// runs the original full-row top-k over the identical score order and tie keys.
+template <typename QLIT>
+__aicore__ inline bool QuantLightningIndexerKernel<QLIT>::TrySplitDecodeScores(uint32_t &scoreTile)
+{
+    constexpr uint32_t minSequenceForSplit = 16 * 1024;
+    // Vec1 loads descales in 16-page packets, and cube loads K in page pairs.
+    constexpr uint32_t pagesPerPacket = 16;
+    const uint32_t queries = static_cast<uint32_t>(constInfo.qSeqSize);
+    const uint32_t groupsPerRequest = QLICommon::CeilDiv(queries, constInfo.s1BaseSize);
+    const uint32_t groups = groupsPerRequest * constInfo.batchSize;
+    if (groups == 0 || groups > usedCoreNum / 2 || constInfo.kSeqSize < minSequenceForSplit) {
+        return false;
+    }
+    // All mixed cores must agree whether to enter the score-publication barrier.
+    bool hasLongRequest = false;
+    for (uint32_t b = 0; b < constInfo.batchSize; ++b) {
+        if (actualSeqLengthsGm.GetValue(b) >= minSequenceForSplit) {
+            hasLongRequest = true;
+            break;
+        }
+    }
+    if (!hasLongRequest) {
+        return false;
+    }
+
+    scoreTile = aiCoreIdx % groups;
+    const uint32_t request = scoreTile / groupsPerRequest;
+    const uint32_t queryGroup = scoreTile % groupsPerRequest;
+    const uint32_t keyLength = actualSeqLengthsGm.GetValue(request);
+    const uint32_t tiles = GetS2BaseBlockNumOnMask(queryGroup, queries, keyLength);
+    const uint32_t packets = QLICommon::CeilDiv(tiles, pagesPerPacket);
+    const uint32_t shards = QLICommon::Min(usedCoreNum / groups, packets);
+    const uint32_t shard = aiCoreIdx / groups;
+    reduceScoreTile = shard == 0;
+    splitCoreInfo.isCoreEnable = shard < shards;
+    if (splitCoreInfo.isCoreEnable) {
+        // The host limits max key length to the AVSG 24-bit token range, so
+        // packet indices times the number of physical cube groups fit uint32.
+        splitCoreInfo.s2Start = (packets * shard / shards) * pagesPerPacket;
+        splitCoreInfo.s2End = QLICommon::Min(tiles, (packets * (shard + 1) / shards) * pagesPerPacket) - 1;
+        splitCoreInfo.bN2Start = splitCoreInfo.bN2End = request;
+        splitCoreInfo.gS1Start = splitCoreInfo.gS1End = queryGroup;
+    }
+    return true;
+}
+
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx,
                                                                               uint32_t s1Start)
@@ -371,7 +424,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengthsK);
 
     // 获取分核信息
-    SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
+    uint32_t scoreTile = aiCoreIdx;
+    splitScores = TrySplitDecodeScores(scoreTile);
+    if (!splitScores) {
+        SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
+    }
 
     pipe = tPipe;
 
@@ -381,7 +438,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(
     uint64_t singleCoreScoreSize = constInfo.s1BaseSize *
                                    QLICommon::Align((uint64_t)constInfo.kSeqSize, (uint64_t)constInfo.s2BaseSize) *
                                    sizeof(SCORE_T);
-    scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + aiCoreIdx * singleCoreScoreSize));
+    scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + scoreTile * singleCoreScoreSize));
     offset += GetBlockNum() * singleCoreScoreSize;
 
     if ASCEND_IS_AIV {
@@ -490,7 +547,24 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Process()
         return;
     }
 
-    ProcessMain();
+    QLICommon::RunInfo lastBlock{};
+    ProcessMain(lastBlock);
+    if (splitScores) {
+        if ASCEND_IS_AIV {
+            const auto event = static_cast<event_t>(pipe->FetchEventID(HardEvent::MTE3_S));
+            SetFlag<HardEvent::MTE3_S>(event);
+            WaitFlag<HardEvent::MTE3_S>(event);
+        }
+        AscendC::SyncAll<false>();
+        if ASCEND_IS_AIV {
+            if (reduceScoreTile) {
+                vectorService.ProcessTopK(lastBlock);
+            }
+        }
+    }
+    if (splitCoreInfo.isCoreEnable) {
+        FreeEvents();
+    }
 }
 
 template <typename QLIT>
@@ -518,7 +592,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 }
 
 template <typename QLIT>
-__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain(QLICommon::RunInfo &runInfo)
 {
     if (!splitCoreInfo.isCoreEnable) {
         return;
@@ -532,7 +606,6 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         matmulService.AllocEventID();
     }
 
-    QLICommon::RunInfo runInfo;
     uint32_t qliGLoop = 0;
     uint32_t qScaleLoop = 0U;
     for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
@@ -559,7 +632,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
         }
         splitCoreInfo.gS1Start = 0;
     }
+}
 
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::FreeEvents()
+{
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
     } else {
@@ -575,7 +652,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint32_t qliLoop, uint64_t s2LoopIdx,
-                                                                           QLICommon::RunInfo qliRunInfo,
+                                                                           QLICommon::RunInfo &qliRunInfo,
                                                                            uint32_t qliQScaleLoop,
                                                                            uint32_t qliKScaleLoop)
 {
@@ -584,7 +661,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessBaseBlock(uint3
         matmulService.ComputeMm1(qliRunInfo);
     } else {
         vectorService.ProcessVec1(qliRunInfo);
-        if (qliRunInfo.isLastS2InnerLoop) { // 本核s2last
+        if (!splitScores && qliRunInfo.isLastS2InnerLoop) {
             vectorService.ProcessTopK(qliRunInfo);
         }
     }

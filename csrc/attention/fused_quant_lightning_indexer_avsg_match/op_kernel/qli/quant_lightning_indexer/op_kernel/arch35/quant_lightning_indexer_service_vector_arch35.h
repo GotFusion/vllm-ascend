@@ -16,6 +16,7 @@
 #define QUANT_LIGHTNING_INDEXER_SERVICE_VECTOR_H
 
 #include "kernel_operator.h"
+#include "../../../../avsg_row_handoff.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
@@ -44,6 +45,7 @@ public:
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info);
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info);
     __aicore__ inline void InitBuffers(TPipe *pipe);
+    __aicore__ inline void SetLocalTopkRow(avsg_fusion::LocalTopkRow *row) { localRow_ = row; }
     __aicore__ inline void InitParams(const struct QLICommon::ConstInfo &constInfo,
                                       const QLITilingData *__restrict tilingData);
     __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm);
@@ -80,6 +82,9 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
+    avsg_fusion::LocalTopkRow *localRow_ = nullptr;
+    template <typename Allocator>
+    __aicore__ inline void InitVectorBuffers(Allocator *allocator);
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo &runInfo, LocalTensor<SCALE_T> &kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
     // ================================Local Buffer区====================================
@@ -143,35 +148,52 @@ private:
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
 {
-    pipe->InitBuffer(resMm1Buf_, 2 * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ * sizeof(QK_T));
+    if (localRow_ != nullptr) {
+        InitVectorBuffers(&localRow_->scratch);
+    } else {
+        InitVectorBuffers(pipe);
+    }
+}
+
+template <typename QLIT>
+template <typename Allocator>
+__aicore__ inline void QLIVector<QLIT>::InitVectorBuffers(Allocator *allocator)
+{
+    allocator->InitBuffer(resMm1Buf_, 2 * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ * sizeof(QK_T));
     resMm1UB_ = resMm1Buf_.Get<QK_T>();
-    pipe->InitBuffer(weightBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
+    allocator->InitBuffer(weightBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
     weightUB_ = weightBuf_.Get<W_T>();
-    pipe->InitBuffer(weightFloatBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
+    allocator->InitBuffer(weightFloatBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
     weightFloatUB_ = weightFloatBuf_.Get<float>();
-    pipe->InitBuffer(kScaleBuf_, 2 * s2BaseSize_ * 16 * sizeof(SCALE_T));
+    allocator->InitBuffer(kScaleBuf_, 2 * s2BaseSize_ * 16 * sizeof(SCALE_T));
     kScaleUB_ = kScaleBuf_.Get<SCALE_T>();
-    pipe->InitBuffer(qScaleBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
+    allocator->InitBuffer(qScaleBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
     qScaleUB_ = qScaleBuf_.Get<SCALE_T>();
 
-    pipe->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));
+    allocator->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));
     vec1OutUB_ = outBuf_.Get<SCORE_T>();
 
     // Topk
-    pipe->InitBuffer(mrgValueBuf_, (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T));
+    allocator->InitBuffer(mrgValueBuf_, (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T));
     mrgValueLocal_ = mrgValueBuf_.Get<SCORE_T>();
     outInvalidLocal_ = mrgValueBuf_.Get<int32_t>();
 
-    pipe->InitBuffer(indicesOutBuf_,
-                     (topkCountAlign256_ + 64) *
-                         sizeof(uint32_t)); // 大小：(topkCountAlign256_ + 64) * 4  64:duplicate刷-1需要额外空间
-    indicesOutLocal_ = indicesOutBuf_.Get<uint32_t>();
+    if (localRow_ != nullptr) {
+        // Every retained row is a full, aligned 2048-entry top-k. The temporary
+        // 64-element padding below is only needed for LI's short-key fill path.
+        indicesOutLocal_ = localRow_->tokens.ReinterpretCast<uint32_t>();
+    } else {
+        allocator->InitBuffer(indicesOutBuf_,
+                         (topkCountAlign256_ + 64) *
+                             sizeof(uint32_t)); // 大小：(topkCountAlign256_ + 64) * 4  64:duplicate刷-1需要额外空间
+        indicesOutLocal_ = indicesOutBuf_.Get<uint32_t>();
+    }
 
-    pipe->InitBuffer(scoreOutBuf_, topkCountAlign256_ * sizeof(SCORE_T));
+    allocator->InitBuffer(scoreOutBuf_, topkCountAlign256_ * sizeof(SCORE_T));
     scoreOutLocal_ = scoreOutBuf_.Get<SCORE_T>();
 
     uint64_t topkSharedTmpSize = topkOp_.GetSharedTmpBufferSize();
-    pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
+    allocator->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
     topkSharedTmpLocal_ = topkSharedTmpBuf_.Get<uint32_t>();
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
 
@@ -576,8 +598,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
-        AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (qliCurS1Idx + qliRowIdx) * topkCount_],
-                             indicesOutLocal_.ReinterpretCast<int32_t>(), qliCopyOutParams);
+        if (localRow_ == nullptr) {
+            AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (qliCurS1Idx + qliRowIdx) * topkCount_],
+                                 indicesOutLocal_.ReinterpretCast<int32_t>(), qliCopyOutParams);
+        }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     }
 }

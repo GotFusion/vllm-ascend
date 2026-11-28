@@ -1,6 +1,8 @@
 # FP8 Lightning Indexer with AVSG KVMatch on Ascend 950
 
-The operator selects 2,048 tokens per query and resolves them to persistent hot KV slots in one mixed Cube/Vector kernel launch. It runs the Ascend 950 CANN FP8 indexer, writes the selected logical IDs into the slots output, waits for all producers, and rewrites that buffer with the AVSG slot indices. One vector core owns all the query rows of a request during matching. The caller applies the returned copy plan before consuming the slots.
+The operator selects 2,048 tokens per query and resolves them to persistent hot KV slots in one mixed Cube/Vector kernel launch. For single-query decode with at least one Cube group per request, the Vector core that produces the top-k keeps the 2,048 logical IDs in its unified buffer (UB) and matches them directly against the request's AVSG state. Other shapes publish the selected IDs to device memory so that one Vector core can match all query rows of a request together. The caller applies the returned copy plan before consuming the slots.
+
+On long prefixes with spare Cube groups, multiple groups score distinct ranges of the same request. They synchronize before the reducer runs the original full-row top-k to preserve selection order. For single-query decode the matcher also reuses the slots found during its first lookup when refreshing their lifetimes.
 
 ## Torch API
 

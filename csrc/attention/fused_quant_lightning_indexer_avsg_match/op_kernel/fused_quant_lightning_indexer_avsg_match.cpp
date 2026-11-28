@@ -76,25 +76,47 @@ extern "C" __global__ __aicore__ void fused_quant_lightning_indexer_avsg_match(
         return;
     }
 
+    // V1 assigns a complete one-query request to one MIX group when there
+    // are enough groups. The even AIV writes the final top-k for that request.
+    const bool oneRowPerGroup = shape.bSize == shape.tSize && shape.bSize <= shape.usedCoreNum;
+    avsg_fusion::LocalTopkRow localRow;
+    avsg_fusion::LocalTopkRow *retained = nullptr;
     {
         Indexer indexer;
+        if ASCEND_IS_AIV {
+            if (oneRowPerGroup && GetBlockIdx() % 2 == 0 && GetBlockIdx() / 2 < shape.bSize) {
+                localRow.Init(pipe, shape.sparseCount, shape.ubBytes);
+                retained = &localRow;
+                indexer.vectorService.SetLocalTopkRow(retained);
+            }
+        }
         indexer.Init(query, key, weights, queryScale, keyScale, queryEnds, keyLengths, fullBlockTable,
                      slots, GetUserWorkspace(workspace), &shape, &pipe);
         indexer.Process();
     }
 
-    // A request's query rows can have different producer AIVs. Publish every
-    // final top-k write before its batch owner rewrites those rows with KV slots.
-    if ASCEND_IS_AIV {
-        const auto event = static_cast<event_t>(pipe.FetchEventID(HardEvent::MTE3_S));
-        SetFlag<HardEvent::MTE3_S>(event);
-        WaitFlag<HardEvent::MTE3_S>(event);
+    if (oneRowPerGroup) {
+        if (retained == nullptr) {
+            return;
+        }
+        // Drain LI's local operations before reusing its scratch. The top-k
+        // allocation remains live across this reset, on its producing AIV.
+        PipeBarrier<PIPE_ALL>();
+        localRow.scratch.Reset();
+    } else {
+        if ASCEND_IS_AIV {
+            const auto event = static_cast<event_t>(pipe.FetchEventID(HardEvent::MTE3_S));
+            SetFlag<HardEvent::MTE3_S>(event);
+            WaitFlag<HardEvent::MTE3_S>(event);
+        }
+        SyncAll<false>(); // All query-row producers must publish GM before Match.
+        if ASCEND_IS_AIV {
+            pipe.Reset();
+        }
     }
-    SyncAll<false>(); // All launched Cube and Vector cores, including idle LI workers.
     if ASCEND_IS_AIV {
-        pipe.Reset();
         AvsgMatchNs::RunAvsgMatch(&pipe, hotBlockTable, status, statusOut, slots, fullBlockTable, keyLengths,
                                   queryEnds, hits, copyMapping, copyCount, shape.bSize, shape.tSize,
-                                  shape.maxBlockNumPerBatch, shape.capacity, shape.ubBytes, shape.vectorCores);
+                                  shape.maxBlockNumPerBatch, shape.capacity, shape.ubBytes, shape.vectorCores, retained);
     }
 }

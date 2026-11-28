@@ -9,3 +9,9 @@ License: CANN Open Software License Agreement Version 2.0 (../../LICENSE).
 Two internal C++ identifiers in lightning_indexer_v2_topk_base.h and
 lightning_indexer_v2_vector1_base.h use the local names IndexType and allOnes.
 The source copyright and license notices are preserved.
+
+The local quant_lightning_indexer_service_vector_arch35.h can retain a final
+Q=1 index row in the producing vector core for the AVSG epilogue.
+
+The local quant_lightning_indexer_kernel_arch35.h can shard decode score tiles
+across cube groups before running the original full-row top-k.

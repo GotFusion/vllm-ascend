@@ -7,6 +7,7 @@
 #define VLLM_ASCEND_AVSG_MATCH_EPILOGUE_H
 
 #include "kernel_operator.h"
+#include "../avsg_row_handoff.h"
 
 namespace AvsgMatchNs {
 // These fields are local scalar parameters for the recipes device implementation;
@@ -37,21 +38,21 @@ struct AvsgMatchTilingData {
 #include "avsg_match_split_bs_reuse_vec.h"
 
 namespace AvsgMatchNs {
-// All producer AIVs must finish writing sparseIndices and synchronize before the
-// caller resets the LI pipe and enters here. Each active AIV owns complete requests
-// so that all query rows of a request share the same persistent state and hit count.
+// Each worker owns complete requests. With a local Q=1 row, the producing
+// even-numbered AIV owns request blockIdx/2. Otherwise IDs arrive through GM.
 __aicore__ inline void RunAvsgMatch(
     AscendC::TPipe* pipe, GM_ADDR hotBlockTable, GM_ADDR status, GM_ADDR statusOut, GM_ADDR sparseIndices,
     GM_ADDR fullBlockTable, GM_ADDR keyLengths, GM_ADDR cumulativeQueryLengths, GM_ADDR hits, GM_ADDR copyMapping, GM_ADDR copyCount,
     uint32_t batch, uint32_t queryRows, uint32_t fullPagesPerRequest, uint32_t capacity, uint32_t ubBytes,
-    uint32_t vectorCores)
+    uint32_t vectorCores, avsg_fusion::LocalTopkRow *localRow)
 {
     if (batch == 0 || vectorCores == 0) {
         return;
     }
     const uint32_t requestsPerCore = (batch - 1) / vectorCores + 1;
     const uint32_t activeCores = (batch - 1) / requestsPerCore + 1;
-    if (AscendC::GetBlockIdx() >= activeCores) {
+    const uint32_t worker = localRow == nullptr ? AscendC::GetBlockIdx() : AscendC::GetBlockIdx() / 2;
+    if (worker >= activeCores) {
         return;
     }
 
@@ -66,9 +67,9 @@ __aicore__ inline void RunAvsgMatch(
     config.statesize = capacity;
     config.ubSize = ubBytes;
 
-    AvsgMatchSplitBsReuseVec match(pipe, &config);
+    AvsgMatchSplitBsReuseVec match(pipe, &config, localRow);
     match.Init(hotBlockTable, status, statusOut, sparseIndices, fullBlockTable, keyLengths, cumulativeQueryLengths, hits,
-               copyMapping, copyCount);
+               copyMapping, copyCount, worker);
     match.Process();
 }
 } // namespace AvsgMatchNs
