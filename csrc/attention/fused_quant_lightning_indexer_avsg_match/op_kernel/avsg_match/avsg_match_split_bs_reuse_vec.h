@@ -572,35 +572,32 @@ private:
 #endif
     }
 
-    __aicore__ inline void ProcessMissMaskAndUpdateMatchTopkId(LocalTensor<uint8_t> result, LocalTensor<int32_t>& selTopKIdLocal, LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, uint64_t& mismatchNum, uint64_t& matchNum, int32_t totalNum){
+    __aicore__ inline void ProcessMissMaskAndUpdateMatchTopkId(
+        LocalTensor<uint8_t> mismatchMask, LocalTensor<int32_t>& tokens, LocalTensor<int32_t>& state,
+        TempBufferCursor cursor, uint64_t& misses, uint64_t& hits, int32_t count, bool refreshHits)
+    {
+        LocalTensor<int32_t> buckets = cursor.Alloc<int32_t>(count);
+        LocalTensor<uint8_t> matchMask = cursor.Alloc<uint8_t>(count);
+        ProbeHashTable(buckets, matchMask, tokens, state, cursor.Fork(), count, {true, false});
 
-        HashMaskType maskType{true, false};  // match mode
-        LocalTensor<int32_t> hashLocal = cursor.Alloc<int32_t>(totalNum);
-        LocalTensor<uint8_t> matchMask = cursor.Alloc<uint8_t>(totalNum);
-        ProbeHashTable(hashLocal, matchMask, selTopKIdLocal, hashMapping, cursor.Fork(), totalNum, maskType);
-
-        LocalTensor<int32_t> recordIndex = cursor.Alloc<int32_t>(chunkSize_);
-        // Update HashStatus By Match Mask
-        uint64_t validNum = 0;
-        GatherByBitMask(recordIndex, matchMask, hashLocal, validNum, totalNum);
-        GatherRecordIndexFromHash(recordIndex, hashLocal, hashMapping, cursor.Fork(), totalNum); // Reused Ub_ chunkTopkId
-        ExtractTopkIndex(recordIndex, recordIndex, cursor.Fork(), totalNum);
-
-        // Update Match SelTopkId — V pipe Select replaces S pipe Scatter
-        LocalTensor<int32_t> tmpBuf = cursor.Alloc<int32_t>(totalNum);
-        LocalTensor<int32_t> matchIndices= recordIndex; //Reused Ub_
-        AscendC::Select(selTopKIdLocal.template ReinterpretCast<float>(), matchMask, recordIndex.template ReinterpretCast<float>(), selTopKIdLocal.template ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, totalNum);
-        AscendC::PipeBarrier<PIPE_V>();
-        matchNum += validNum;
-
-        // GetMissMatchMask
-        AscendC::Not(result.template ReinterpretCast<uint16_t>(), matchMask.template ReinterpretCast<uint16_t>(), totalNum/AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
-        AscendC::PipeBarrier<PIPE_V>();
-        IgnoreInvalidTopk(result, selTopKIdLocal, cursor.Fork(), totalNum);
-        PipeBarrier<PIPE_ALL>();
-        AscendC::CreateVecIndex(tmpBuf, 0, totalNum);
+        LocalTensor<int32_t> slots = cursor.Alloc<int32_t>(count);
+        GatherRecordIndexFromHash(slots, buckets, state, cursor.Fork(), count);
+        ExtractTopkIndex(slots, slots, cursor.Fork(), count);
+        uint64_t hitCount = 0;
+        // buckets is dead after resolving the slots. Reuse it for the compact hit list.
+        GatherByBitMask(buckets, matchMask, slots, hitCount, count);
+        if (refreshHits && hitCount != 0) {
+            RefreshRecord(buckets, state, cursor.Fork(), MAX_RECORD_LIFETIME, hitCount);
+        }
+        hits += hitCount;
+        AscendC::Select(tokens.template ReinterpretCast<float>(), matchMask, slots.template ReinterpretCast<float>(),
+                        tokens.template ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
         PipeBarrier<PIPE_V>();
-        GatherByBitMask(matchIndices, result, tmpBuf, mismatchNum, totalNum);
+        AscendC::Not(mismatchMask.template ReinterpretCast<uint16_t>(), matchMask.template ReinterpretCast<uint16_t>(),
+                     count / AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
+        PipeBarrier<PIPE_V>();
+        IgnoreInvalidTopk(mismatchMask, tokens, cursor.Fork(), count);
+        GatherByBitMask(buckets, mismatchMask, tokens, misses, count);
     }
 
     __aicore__ inline void RefreshMatchStatus(LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, int32_t globalTOffset, int32_t numSeqs){
@@ -783,19 +780,18 @@ private:
         LocalTensor<int32_t> records = cursor.Alloc<int32_t>(totalNum); // 在totalNum中找空闲的位置 totalNum <= tiling_->stateSize
         LocalTensor<int32_t> tmpBuf = cursor.Current(); // 在totalNum中找空闲的位置 totalNum <= tiling_->stateSize
 
+        // Aging changes the signed record byte only. The set of unused token
+        // slots stays the same throughout this victim search.
         PipeBarrier<PIPE_ALL>();
         AscendC::CreateVecIndex(records, 0, totalNum);
         PipeBarrier<PIPE_V>();
-        while(emptyNum < requiredNum){
-
-            GatherRecordIdFromHash(records, records, statusLocal, cursor.Fork(), totalNum);
-            isNegative(emptyMask, records, cursor.Fork(), true, totalNum);
-            PipeBarrier<PIPE_ALL>();
-            AscendC::CreateVecIndex(records, 0, totalNum);
-            PipeBarrier<PIPE_V>();
-            GatherByBitMask(tmpBuf, emptyMask, records, emptyNum, totalNum);
-            if(emptyNum >= requiredNum) break;
-
+        GatherRecordIdFromHash(records, records, statusLocal, cursor.Fork(), totalNum);
+        isNegative(emptyMask, records, cursor.Fork(), true, totalNum);
+        PipeBarrier<PIPE_ALL>();
+        AscendC::CreateVecIndex(records, 0, totalNum);
+        PipeBarrier<PIPE_V>();
+        GatherByBitMask(tmpBuf, emptyMask, records, emptyNum, totalNum);
+        while (emptyNum < requiredNum) {
             GatherPackedTokenFromHash(records, records, statusLocal, cursor.Fork(), totalNum);
             ExtractRecord(records, records, totalNum);
             isNegative(emptyMask, records, cursor.Fork(), true, totalNum);
@@ -975,21 +971,18 @@ private:
 
             TempBufferCursor cursor = rootCursor.Fork(); // 每个batch重新创建cursor
 
-            InitStageOneCopyMapping(cursor, tOffset, (globalBatchId == tiling_->batchsize-1) ? tiling_->t - tOffset : curFullQSeqLen);
-            SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
-
-            if (curFullKvSeqLen <= 0){
-                selKvActSeqLocal.SetValue(loopIdx, 0);
-                continue;
-            }
-
             LocalTensor<int32_t> statusLocal = cursor.Alloc<int32_t>(selBlockStatUb_ / sizeof(int32_t));
             CopyInBlockStatus(loopIdx, statusLocal);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
 
             DecrementRecordCounters(statusLocal, cursor.Fork(), 1, tiling_->statesize);
 
-            RefreshMatchStatus(statusLocal, cursor.Fork(), tOffset, curFullQSeqLen);
+            // A multi-query request must reserve hits in every row before the
+            // first eviction. A single row can refresh its hits during lookup.
+            const bool singleRow = curFullQSeqLen == 1;
+            if (!singleRow) {
+                RefreshMatchStatus(statusLocal, cursor.Fork(), tOffset, curFullQSeqLen);
+            }
 
             // block table 按 batch 索引，对本 batch 所有 seq/head 相同，循环外加载一次即可
             LocalTensor<int32_t> localFullBlkTable, localSelBlkTable;
@@ -1006,7 +999,7 @@ private:
 
                     uint64_t mismatchNum = 0;
                     LocalTensor<uint8_t> mismatchMask = seqCursor.Alloc<uint8_t>(tiling_->topk);
-                    ProcessMissMaskAndUpdateMatchTopkId(mismatchMask, selTopKIdLocal, statusLocal, seqCursor.Fork(), mismatchNum, reusedNum, tiling_->topk);
+                    ProcessMissMaskAndUpdateMatchTopkId(mismatchMask, selTopKIdLocal, statusLocal, seqCursor.Fork(), mismatchNum, reusedNum, tiling_->topk, singleRow);
 
                     if (mismatchNum > 0) {
                         LocalTensor<int32_t> emptyIdxLocal = seqCursor.Current();
@@ -1020,6 +1013,9 @@ private:
                         }
 
                         ProcessMisMatchTopkId(mismatchMask, selTopKIdLocal, statusLocal, emptyIdxLocal, localFullBlkTable, localSelBlkTable, seqCursor.Fork(), globalIndex, mismatchNum, tiling_->topk);
+                    } else {
+                        // Miss handling already writes a full row padded with -1.
+                        WriteEmptyCopyMapping(seqCursor.Fork(), globalIndex);
                     }
                     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
                     mismatchNumLocal.SetValue(globalIndex - gmStart, static_cast<int32_t>(mismatchNum));
@@ -1064,17 +1060,14 @@ private:
         DataCopyPad(stageOneCopyMappingGM_[gmOffset], stageOneAddressMappingLocal, dataCopyParAddrMapping);
     }
 
-    __aicore__ inline void InitStageOneCopyMapping(TempBufferCursor cursor, int64_t tOffset, int64_t qlen){
-        int64_t nums = offsetOutputUb_ / sizeof(int32_t);
-        int64_t gmOffset = tOffset * tiling_->headnum * nums;
-        LocalTensor<int32_t> topkIdToIdxMap = cursor.Alloc<int32_t>(nums);
-        AscendC::Duplicate(topkIdToIdxMap, INVALID_SLOT, nums);
-        DataCopyExtParams dataCopyParAddrMapping{
-        static_cast<uint16_t>(1), static_cast<uint32_t>(nums * sizeof(int32_t)), 0, 0, 0};
+    __aicore__ inline void WriteEmptyCopyMapping(TempBufferCursor cursor, int64_t row)
+    {
+        int64_t words = offsetOutputUb_ / sizeof(int32_t);
+        LocalTensor<int32_t> mapping = cursor.Alloc<int32_t>(words);
+        AscendC::Duplicate(mapping, INVALID_SLOT, words);
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        for(int32_t idx = 0; idx<qlen; idx++){
-            DataCopyPad(stageOneCopyMappingGM_[gmOffset + idx * tiling_->headnum * nums], topkIdToIdxMap, dataCopyParAddrMapping);
-        }
+        CopyOutStageOneCopyMapping(row, mapping);
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
 
     __aicore__ inline void CopyOutTopKIndices(int64_t globalOffset, LocalTensor<int32_t>& selTopKIdLocal){

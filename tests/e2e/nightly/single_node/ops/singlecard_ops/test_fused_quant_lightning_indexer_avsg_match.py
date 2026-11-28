@@ -42,14 +42,14 @@ def physical_rows(pages, logical):
 
 
 class Case:
-    def __init__(self, batch, lanes, capacity, length, steps):
+    def __init__(self, batch, lanes, capacity, length, steps, *, key_lengths=None):
         self.batch = batch
         self.lanes = lanes
         self.capacity = capacity
         self.length = length
         self.fused = load_fused()
         generator = torch.Generator().manual_seed(1024)
-        pages = batch * (length // PAGE)
+        pages = batch * ((length + PAGE - 1) // PAGE)
         self.full_pages = torch.randperm(pages, dtype=torch.int32, generator=generator).view(batch, -1)
         self.hot_pages = torch.randperm(batch * capacity // PAGE, dtype=torch.int32, generator=generator).view(
             batch, -1
@@ -57,14 +57,17 @@ class Case:
         self.full_table = self.full_pages.npu()
         self.hot_table = self.hot_pages.npu()
         self.q_ends = torch.arange(lanes, batch * lanes + 1, lanes, dtype=torch.int32).npu()
-        self.k_lens = torch.full((batch,), length, dtype=torch.int32).npu()
+        self.key_lengths = [length] * batch if key_lengths is None else key_lengths
+        self.k_lens = torch.tensor(self.key_lengths, dtype=torch.int32, device="npu")
         self.status = torch.full((batch, 2 * capacity), -1, dtype=torch.int32, device="npu")
 
         key = torch.randn((pages, PAGE, 1, DIM), generator=generator, dtype=torch.bfloat16)
         self.key = key.to(torch.float8_e4m3fn).npu()
         key_scale = 0.9 + 0.2 * torch.rand((pages, PAGE, 1), generator=generator)
         # Ensure the MTP tail is selected so clearing uncommitted rows is observable.
-        key_scale[self.full_pages[:, -1].long(), -lanes:, :] = 32.0
+        for b, k_len in enumerate(self.key_lengths):
+            tail = torch.arange(k_len - lanes, k_len)
+            key_scale[self.full_pages[b, tail // PAGE].long(), tail % PAGE, :] = 32.0
         self.key_scale = key_scale.npu()
         shape = (batch * lanes, HEADS)
         self.query_scale = (0.9 + 0.2 * torch.rand(shape, generator=generator)).npu()
@@ -137,12 +140,13 @@ def check_step(case, query, memory):
 
         # Check all lanes *after* the last write: a later lane must not evict an earlier lane's top-k.
         actual_source = memory[hot[slots[b]]]
-        torch.testing.assert_close(actual_source.sort().values, expected_source.sort().values)
+        torch.testing.assert_close(actual_source, expected_source)
         tokens = status[b, :, 0] & TOKEN_MASK
         valid = tokens != TOKEN_MASK
-        assert (tokens[valid] <= case.length - case.lanes).all()
+        last_committed = case.key_lengths[b] - case.lanes
+        assert (tokens[valid] <= last_committed).all()
         if case.lanes > 1:
-            assert (expected[b] > case.length - case.lanes).any()
+            assert (expected[b] > last_committed).any()
         torch.testing.assert_close(memory[hot[valid]], physical_rows(case.full_pages[b], tokens[valid]))
         memory[hot[~valid]] = -1
     return hits
@@ -156,6 +160,17 @@ def test_persistent_match(batch, lanes, capacity):
     hits = check_step(case, case.queries[0], memory)
     assert (hits > 0).all()
     check_step(case, case.queries[1], memory)
+
+
+@pytest.mark.parametrize("lanes", [1, 4])
+def test_ragged_key_tiles_keep_order_and_state(lanes):
+    # Uneven requests exercise the first/last tile of each score producer.
+    # The first request's earliest query sees exactly one full top-k.
+    lengths = [TOPK + lanes - 1, 8191, 8193, 32767, 65533]
+    case = Case(len(lengths), lanes, 8192, length=max(lengths), steps=2, key_lengths=lengths)
+    memory = torch.full((case.batch * case.capacity,), -1, dtype=torch.long)
+    for query in (case.queries[0], case.queries[1], case.queries[0]):
+        check_step(case, query, memory)
 
 
 @pytest.mark.parametrize("invalid", ["q_end", "key_too_long", "key_too_short"])
