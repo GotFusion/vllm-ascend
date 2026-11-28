@@ -2,7 +2,9 @@
 
 The operator selects 2,048 tokens per query and resolves them to persistent hot KV slots in one mixed Cube/Vector kernel launch. For single-query decode with at least one Cube group per request, the Vector core that produces the top-k keeps the 2,048 logical IDs in its unified buffer (UB) and matches them directly against the request's AVSG state. Other shapes publish the selected IDs to device memory so that one Vector core can match all query rows of a request together. The caller applies the returned copy plan before consuming the slots.
 
-On long prefixes with spare Cube groups, multiple groups score distinct ranges of the same request. They synchronize before the reducer runs the original full-row top-k to preserve selection order. For single-query decode the matcher also reuses the slots found during its first lookup when refreshing their lifetimes.
+On prefixes of at least 16,384 tokens with spare Cube groups, multiple groups score distinct ranges of the same request. They synchronize before the reducer runs the original full-row top-k to preserve selection order. The split decision uses the prefix length and launch geometry. The 4K and 8K hot-cache settings specify resident KV slots per request.
+
+The matcher probes up to four hash buckets in vector registers and uses the resolved slot for both output and lifetime refresh. With four queries, it protects hits in the three later rows before processing row zero, so eviction cannot invalidate their resident selections. It scans packed records in slot order, preferring empty slots when enough are available, then uses expired slots and ages the table as needed. It writes each physical source and destination directly into the copy plan.
 
 ## Torch API
 
@@ -40,7 +42,7 @@ For example, use `hot_block_table[b,slot//128]*128 + slot%128` to translate a re
 
 ## Validation
 
-The Ascend 950 package includes the operator through the normal vLLM Ascend custom-op build. The nightly test uses official FP8 LI selections and replays the physical KV transfer plan across successive steps on non-identity page tables. It covers both batch sizes, all supported 4K/8K configurations, cold and reused state, multi-query eviction, and invalid lengths. Run it against a built extension on an idle device.
+The Ascend 950 package includes the operator through the normal vLLM Ascend custom-op build. The nightly test uses official FP8 LI selections and replays the physical KV transfer plan across successive steps on non-identity page tables. It covers the six 4K/8K benchmark shapes, ragged lengths, short prefixes, more requests than Cube groups, and invalid lengths. A targeted test seeds the hash and lifetime fields to check empty-slot priority and repeated aging against the expected complete state. Run it against a built extension on an idle device.
 
 ```sh
 pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_fused_quant_lightning_indexer_avsg_match.py
