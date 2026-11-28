@@ -173,6 +173,17 @@ def test_ragged_key_tiles_keep_order_and_state(lanes):
         check_step(case, query, memory)
 
 
+@pytest.mark.parametrize(("batch", "lanes", "length"), [(1, 1, 4095), (1, 4, 8191), (33, 1, 2049)])
+def test_unsplit_short_prefix_keeps_order_and_state(batch, lanes, length):
+    # Short prefixes use the original score schedule. On a 32-Cube 950DT,
+    # 33 requests also exercise the single-query GM handoff between workers.
+    case = Case(batch, lanes, 8192, length=length, steps=1)
+    memory = torch.full((batch * case.capacity,), -1, dtype=torch.long)
+    check_step(case, case.queries[0], memory)
+    hits = check_step(case, case.queries[0], memory)
+    assert (hits > 0).all()
+
+
 @pytest.mark.parametrize("invalid", ["q_end", "key_too_long", "key_too_short"])
 def test_bad_lengths_preserve_status(invalid):
     case = Case(batch=8, lanes=1, capacity=4096, length=16 * 1024, steps=1)
