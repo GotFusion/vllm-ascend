@@ -162,6 +162,71 @@ def test_persistent_match(batch, lanes, capacity):
     check_step(case, case.queries[1], memory)
 
 
+def seed_victim_request(request, capacity, misses):
+    """Place every resident at its unique first probe and return the expected pre-insertion state."""
+    residue = torch.arange(capacity)
+    # The lower half of residues occupy odd slots in request 0, even slots in requests 1 and 2.
+    slot = (residue % TOPK) * 2 + ((residue < TOPK) if request == 0 else (residue >= TOPK)).long()
+    token = residue.clone()
+    token[misses:TOPK] += capacity
+    age = torch.full_like(token, 8)
+    if request == 0:
+        token[:misses] = TOKEN_MASK
+        age[:misses] = -1
+        age[TOPK:] = 0  # Earlier even slots are expired but true empty slots take precedence.
+    elif request == 1:
+        token[-1], age[-1] = TOKEN_MASK, -1
+        age[:misses] = 0  # One empty slot is insufficient. The first 65 expired slots are even.
+    else:
+        age[:misses] = 3  # Initial decay to 2, then three more decays before eviction.
+
+    live = token != TOKEN_MASK
+    home = residue * 2039 % capacity
+    state = torch.full((capacity, 2), -1, dtype=torch.int32)
+    state[slot, 0] = ((age << 24) | token).int()
+    state[home[live], 1] = (((token[live] * capacity) & 0x7FFFFF) | slot[live]).int()
+
+    extra_decays = 3 if request == 2 else 0
+    final_age = (age - 1 - extra_decays).clamp_min(-2)
+    final_age[misses:TOPK] = 8 - extra_decays  # Lookup refreshes hits before victim search.
+    expected = state.clone()
+    expected[slot, 0] = ((final_age << 24) | token).int()
+    return state, expected, slot[:TOPK]
+
+
+def test_victim_scan_precedence_and_aging():
+    capacity, misses = 4096, 65
+    case = Case(batch=3, lanes=1, capacity=capacity, length=capacity + TOPK, steps=1)
+    # Only the last K logical keys have positive scores. Within-set order is immaterial.
+    key = torch.zeros(case.key.shape, dtype=torch.bfloat16)
+    key[case.full_pages[:, capacity // PAGE :].long(), :, 0, 0] = 1
+    case.key = key.to(torch.float8_e4m3fn).npu()
+    query = torch.ones(case.queries[0].shape, dtype=torch.bfloat16).to(torch.float8_e4m3fn).npu()
+    fixtures = [seed_victim_request(b, capacity, misses) for b in range(case.batch)]
+    case.status.copy_(torch.stack([s for s, _, _ in fixtures]).reshape_as(case.status).npu())
+
+    slots, hits, plan, counts = (out.cpu() for out in case.run(query))
+    final = case.status.cpu().view(case.batch, capacity, 2)
+    assert (hits == TOPK - misses).all() and (counts == misses).all()
+    for b, (_, expected, resident_slots) in enumerate(fixtures):
+        row = slots[b, 0].long()
+        victims = resident_slots[:misses]
+        torch.testing.assert_close(row.sort().values, resident_slots.sort().values)
+        torch.testing.assert_close(row[torch.isin(row, victims)], victims)
+        src, dst = plan[b, 0, :misses].long().unbind(-1)
+        torch.testing.assert_close(dst, physical_rows(case.hot_pages[b], victims))
+        assert (plan[b, 0, misses:] == -1).all()
+
+        # All 65 misses are in the same physical page, so its address gives their logical order.
+        missing = torch.arange(capacity, capacity + misses)
+        source = physical_rows(case.full_pages[b], missing)
+        torch.testing.assert_close(src.sort().values, source.sort().values)
+        inserted = capacity + src - source[0]
+        expected[victims, 0] = ((8 << 24) | inserted).int()
+        expected[inserted * 2039 % capacity, 1] = (((inserted * capacity) & 0x7FFFFF) | victims).int()
+        torch.testing.assert_close(final[b], expected)
+
+
 @pytest.mark.parametrize("lanes", [1, 4])
 def test_ragged_key_tiles_keep_order_and_state(lanes):
     # Uneven requests exercise the first/last tile of each score producer.
