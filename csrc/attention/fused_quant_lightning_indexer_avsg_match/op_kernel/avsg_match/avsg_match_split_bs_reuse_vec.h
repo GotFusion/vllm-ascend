@@ -267,70 +267,6 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void ExtractStoredFingerprint(
-        LocalTensor<int32_t>& fingerprint, LocalTensor<int32_t>& packedEntry,
-        TempBufferCursor cursor, int32_t nums)
-    {
-        LocalTensor<int32_t> slotPart = cursor.Alloc<int32_t>(nums);
-        StripRecord(fingerprint, packedEntry, nums);
-        AscendC::Adds(slotPart, fingerprint, 0, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-        BitwiseModPowerOfTwo(slotPart, tiling_->statesize, cursor.Fork(), nums);
-        AscendC::Sub(fingerprint, fingerprint, slotPart, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void GetOutdatedMask(LocalTensor<uint8_t>& outdatedMask,
-        LocalTensor<int32_t>& packedEntry,
-        LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, int32_t nums)
-    {
-        LocalTensor<int32_t> storedFingerprint = cursor.Alloc<int32_t>(nums);
-        LocalTensor<int32_t> expectedFingerprint = cursor.Alloc<int32_t>(nums);
-
-        ExtractStoredFingerprint(
-            storedFingerprint, packedEntry, cursor.Fork(), nums);
-
-        ExtractTopkIndex(
-            expectedFingerprint, packedEntry, cursor.Fork(), nums);
-        GatherRecordIdFromHash(expectedFingerprint, expectedFingerprint, hashMapping, cursor.Fork(), nums);
-        ComputeFingerprintFromTopkId(expectedFingerprint, expectedFingerprint,
-            cursor.Fork(), false, nums);
-        CompareNe(outdatedMask, storedFingerprint, expectedFingerprint, nums);
-    }
-
-    // ============================================================
-    // 哈希位置计算
-    // ============================================================
-
-    __aicore__ inline void ComputeHashPosition(LocalTensor<int32_t>& hashId,
-        LocalTensor<int32_t>& topkId, TempBufferCursor cursor, int32_t nums)
-    {
-        AscendC::Muls(hashId, topkId, HASH_PRIME_MULTIPLIER, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-        BitwiseModPowerOfTwo(hashId, tiling_->statesize, cursor.Fork(), nums);
-    }
-
-    // ============================================================
-    // 哈希步长计算
-    // ============================================================
-
-    __aicore__ inline void ComputeHashStride(LocalTensor<int32_t>& stride,
-        LocalTensor<int32_t>& topkId, TempBufferCursor cursor, int32_t nums)
-    {
-        AscendC::Muls(stride, topkId, HASH_STRIDE_MULTIPLIER, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-        BitwiseModPowerOfTwo(stride, tiling_->statesize, cursor.Fork(), nums);
-        // Clear the lowest bit of the masked hash stride.
-        AscendC::ShiftRight(stride.template ReinterpretCast<uint32_t>(),
-            stride.template ReinterpretCast<uint32_t>(), static_cast<uint32_t>(1), nums);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::ShiftLeft(stride.template ReinterpretCast<uint32_t>(),
-            stride.template ReinterpretCast<uint32_t>(), static_cast<uint32_t>(1), nums);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(stride, stride, 1, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
     __aicore__ inline int64_t GetActualQSeqLen(int64_t bsIdx)
     {
         return fullQActualSeqGm_.GetValue(bsIdx);
@@ -481,88 +417,11 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    struct HashMaskType {
-        bool match;
-        bool empty;
-    };
-
-    __aicore__ inline void ComputeHashMatchMask(LocalTensor<uint8_t> result, LocalTensor<int32_t>& hashIdx, LocalTensor<int32_t>& hashMapping, LocalTensor<int32_t>& selTopKIdxLocal, TempBufferCursor cursor, int32_t nums){
-        LocalTensor<int32_t> hashRecordId = cursor.Alloc<int32_t>(nums);
-        LocalTensor<int32_t> gatherResult = cursor.Alloc<int32_t>(nums);
-        AscendC::Duplicate(hashRecordId, INVALID_SLOT, nums);
-        AscendC::Duplicate(gatherResult, INVALID_SLOT, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        GatherRecordIndexFromHash(hashRecordId, hashIdx, hashMapping, cursor.Fork(), nums);
-        ExtractTopkIndex(
-            hashRecordId, hashRecordId, cursor.Fork(), nums);
-        CompareNe(result, hashRecordId, gatherResult, nums);
-
-        LocalTensor<uint8_t> mask = cursor.Alloc<uint8_t>(nums);
-        GatherRecordIdFromHash(hashRecordId, hashRecordId, hashMapping, cursor.Fork(), nums);
-        CompareEq(mask, hashRecordId, selTopKIdxLocal, nums);
-
-        // Combine the valid-slot mask with the token-match mask.
-        AscendC::And(result.template ReinterpretCast<uint16_t>(), result.template ReinterpretCast<uint16_t>(), mask.template ReinterpretCast<uint16_t>(), nums / AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void ComputeHashEmptyMask(LocalTensor<uint8_t> result, LocalTensor<int32_t>& hashIdx, LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, int32_t nums){
-        LocalTensor<int32_t> recordLocal = cursor.Alloc<int32_t>(nums);
-        GatherRecordIndexFromHash(recordLocal, hashIdx, hashMapping, cursor.Fork(), nums);
-
-        LocalTensor<uint8_t> mask = cursor.Alloc<uint8_t>(nums);
-
-        GetOutdatedMask(result, recordLocal, hashMapping, cursor.Fork(), nums);
-
-        ExtractTopkIndex(recordLocal, recordLocal, cursor.Fork(), nums);
-        isNegative(mask, recordLocal, cursor.Fork(), false, nums); // Index 是否小于0， 小于0也为空，
-        AscendC::Or(result.template ReinterpretCast<uint16_t>(), result.template ReinterpretCast<uint16_t>(), mask.template ReinterpretCast<uint16_t>(), nums / AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
-        AscendC::PipeBarrier<PIPE_V>();
-
-        GatherPackedTokenFromHash(recordLocal, recordLocal, hashMapping, cursor.Fork(), nums); // Cache lifetime is in word0.
-        ExtractRecord(recordLocal, recordLocal, nums);
-        isNegative(mask, recordLocal, cursor.Fork(), false, nums);
-        AscendC::Or(result.template ReinterpretCast<uint16_t>(), result.template ReinterpretCast<uint16_t>(), mask.template ReinterpretCast<uint16_t>(), nums / AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
     __aicore__ inline void IgnoreInvalidTopk(LocalTensor<uint8_t> result, LocalTensor<int32_t>& selTopKIdxLocal, TempBufferCursor cursor, int32_t nums){
         LocalTensor<uint8_t> validMask = cursor.Alloc<uint8_t>(nums);
         CompareNe(validMask, selTopKIdxLocal, INVALID_SLOT, nums);
         AscendC::And(result.template ReinterpretCast<uint16_t>(), result.template ReinterpretCast<uint16_t>(), validMask.template ReinterpretCast<uint16_t>(), nums / AscendC::AscendCUtils::GetBitSize(sizeof(uint16_t)));
         AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void ComputeHashMask(LocalTensor<uint8_t> result, LocalTensor<int32_t>& hashIdx, LocalTensor<int32_t>& hashMapping, LocalTensor<int32_t>& selTopKIdxLocal, TempBufferCursor cursor, int32_t nums, HashMaskType maskType){
-        if (maskType.match) {
-            ComputeHashMatchMask(result, hashIdx, hashMapping, selTopKIdxLocal, cursor, nums);
-        } else if (maskType.empty) {
-            ComputeHashEmptyMask(result, hashIdx, hashMapping, cursor, nums);
-        }
-    }
-
-    __aicore__ inline void AdvanceHashProbe(LocalTensor<int32_t>& hashId, LocalTensor<uint8_t> mask, LocalTensor<int32_t>& stride, TempBufferCursor cursor, int32_t modValue, int32_t nums){
-
-        // Skip first nums int32 (for external use)
-        cursor.Alloc<int32_t>(nums);
-
-        // offset = zeros; offset[!mask] = stride[!mask]
-        LocalTensor<float> offset = cursor.Alloc<float>(nums);
-        AscendC::Duplicate(offset, static_cast<float> (0), nums);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Select(offset, mask, offset, stride.template ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, nums); // 1 选择offset， 0 选择floatStride
-        AscendC::PipeBarrier<PIPE_V>();
-
-        // Select already preserved the int32 stride bit pattern. Reinterpret it
-        // directly; a numeric float-to-int cast collapses every positive stride
-        // to one and silently turns double hashing into linear probing.
-        LocalTensor<int32_t> int32offset = offset.template ReinterpretCast<int32_t>();
-        AscendC::Add(hashId, hashId, int32offset, nums);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        BitwiseModPowerOfTwo(hashId, modValue, cursor.Fork(), nums);
     }
 
     template <typename T>
@@ -597,7 +456,7 @@ private:
     {
         LocalTensor<int32_t> buckets = cursor.Alloc<int32_t>(count);
         LocalTensor<uint8_t> matchMask = cursor.Alloc<uint8_t>(count);
-        ProbeHashTable(buckets, matchMask, tokens, state, cursor.Fork(), count, {true, false});
+        ProbeHashTable<AvsgProbeMode::Match>(buckets, matchMask, tokens, state, cursor.Fork(), count);
 
         LocalTensor<int32_t> slots = cursor.Alloc<int32_t>(count);
         GatherRecordIndexFromHash(slots, buckets, state, cursor.Fork(), count);
@@ -621,7 +480,6 @@ private:
 
     __aicore__ inline void RefreshMatchStatus(LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, int32_t globalTOffset, int32_t numSeqs){
 
-        HashMaskType maskType{true, false};  // match mode
         for(int32_t seqId = 0; seqId < numSeqs; seqId++){
             TempBufferCursor chunkCursor = cursor.Fork();
             int32_t globalIndex = (globalTOffset+seqId) * tiling_->headnum;
@@ -631,7 +489,8 @@ private:
 
             LocalTensor<int32_t> chunkHashLocal = chunkCursor.Alloc<int32_t>(tiling_->topk);
             LocalTensor<int32_t> recordIndex = chunkCursor.Alloc<int32_t>(tiling_->topk);
-            ProbeHashTable(chunkHashLocal, matchMask, selTopKIdLocal, hashMapping, chunkCursor.Fork(), tiling_->topk, maskType);
+            ProbeHashTable<AvsgProbeMode::Match>(chunkHashLocal, matchMask, selTopKIdLocal, hashMapping,
+                                                chunkCursor.Fork(), tiling_->topk);
             // Update HashStatus By Match Mask
             uint64_t validNum = 0;
             GatherRecordIndexFromHash(recordIndex, chunkHashLocal, hashMapping, chunkCursor.Fork(), tiling_->topk); // Reused Ub_ chunkTopkId
@@ -646,20 +505,19 @@ private:
 
     }
 
-    __aicore__ inline void ProbeHashTable(LocalTensor<int32_t>& hashId, LocalTensor<uint8_t> mask, LocalTensor<int32_t>& selTopKIdLocal, LocalTensor<int32_t>& hashMapping, TempBufferCursor cursor, int32_t nums, HashMaskType maskType){
-
-        int32_t mod_value = tiling_->statesize;
-        ComputeHashPosition(hashId, selTopKIdLocal, cursor.Fork(), nums);
-        LocalTensor<int32_t> stride = cursor.Alloc<int32_t>(nums);
-        ComputeHashStride(stride, selTopKIdLocal, cursor.Fork(), nums);
-        // Update hashIdx
-        for (int64_t retry = 0; retry < MAX_PROBE_RETRIES; ++retry) {
-            ComputeHashMask(mask, hashId, hashMapping, selTopKIdLocal, cursor.Fork(), nums, maskType);
-            AdvanceHashProbe(hashId, mask, stride, cursor.Fork(), mod_value, nums);
-        }
-        ComputeHashMask(mask, hashId, hashMapping, selTopKIdLocal, cursor.Fork(), nums, maskType);
-
-        IgnoreInvalidTopk(mask, selTopKIdLocal, cursor.Fork(), nums);
+    template <AvsgProbeMode mode>
+    __aicore__ inline void ProbeHashTable(LocalTensor<int32_t>& buckets, LocalTensor<uint8_t> mask,
+        LocalTensor<int32_t>& tokens, LocalTensor<int32_t>& state, TempBufferCursor cursor, int32_t count)
+    {
+        static_assert(AvsgMatchTilingData::topk % AVSG_RECORD_LANES == 0);
+        LocalTensor<int32_t> flags = cursor.Alloc<int32_t>(count);
+        PipeBarrier<PIPE_V>();
+        ProbeAvsgBuckets<mode>((__ubuf__ uint32_t*)buckets.GetPhyAddr(), (__ubuf__ uint32_t*)flags.GetPhyAddr(),
+                               (__ubuf__ uint32_t*)tokens.GetPhyAddr(), (__ubuf__ uint32_t*)state.GetPhyAddr(),
+                               static_cast<uint16_t>(count / AVSG_RECORD_LANES), tiling_->statesize);
+        PipeBarrier<PIPE_V>();
+        CompareEq(mask, flags, 1, count);
+        IgnoreInvalidTopk(mask, tokens, cursor.Fork(), count);
     }
 
     __aicore__ inline void GatherByBitMask(LocalTensor<int32_t>& result, LocalTensor<uint8_t>& mask, LocalTensor<int32_t>& src, uint64_t& validNum, int32_t totalNum){
@@ -678,41 +536,6 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void InterleaveTensors(LocalTensor<int32_t>& result, LocalTensor<int32_t>& topkId, LocalTensor<int32_t>& emptyIdx, TempBufferCursor cursor, uint64_t uniqueNum, uint64_t totalNum){
-        // TODO(kuangwenwei): 后续可以作均匀切分，使得更加均匀
-        // Scatter: Gather+Selection
-        // UpdateCopyMapping
-        uint64_t numTensors = 2;
-        uniqueNum *= numTensors;
-        totalNum *= numTensors;
-        AscendC::LocalTensor<int32_t> indexLocal = cursor.Alloc<int32_t>(totalNum);
-        PipeBarrier<PIPE_ALL>();
-        AscendC::CreateVecIndex(indexLocal, 0, totalNum);
-        PipeBarrier<PIPE_V>();
-        BitwiseModPowerOfTwo(indexLocal, HASH_ENTRY_FIELDS, cursor.Fork(), totalNum); // 0,1,0,1,0,1,0,1,0,1,0,1,0,1,.....,0,1
-        AscendC::LocalTensor<int32_t> tmpbuffIndex = cursor.Alloc<int32_t>(totalNum);
-        AscendC::Duplicate(tmpbuffIndex, 1, totalNum);
-        PipeBarrier<PIPE_V>();
-        LocalTensor<uint8_t> mask = cursor.Alloc<uint8_t>(totalNum / AscendC::AscendCUtils::GetBitSize(sizeof(uint8_t)));
-        CompareEq(mask, indexLocal, tmpbuffIndex, totalNum); // cur != prev
-        PipeBarrier<PIPE_ALL>();
-        AscendC::CreateVecIndex(indexLocal, 0, uniqueNum);
-        PipeBarrier<PIPE_V>();
-        AscendC::ShiftRight(indexLocal, indexLocal, 1, uniqueNum); //Divs_(2)
-        PipeBarrier<PIPE_V>();
-        AscendC::Muls(indexLocal, indexLocal, static_cast<int32_t>(sizeof(int32_t)), uniqueNum);
-        PipeBarrier<PIPE_V>();
-        AscendC::Gather(result, topkId, indexLocal.template ReinterpretCast<uint32_t>(), (uint32_t)0, uniqueNum);
-        PipeBarrier<PIPE_V>();
-        AscendC::Gather(tmpbuffIndex, emptyIdx, indexLocal.template ReinterpretCast<uint32_t>(), (uint32_t)0, uniqueNum);
-        PipeBarrier<PIPE_V>();
-        AscendC::Adds(indexLocal, tmpbuffIndex, 0, uniqueNum);
-        PipeBarrier<PIPE_V>();
-
-        AscendC::Select(result.template ReinterpretCast<float>(), mask, indexLocal.template ReinterpretCast<float>(), result.template ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,  uniqueNum);   // true: tmpbuffIndex, false: result
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
     __aicore__ inline void RefreshRecord(LocalTensor<int32_t>& emptyIdx, LocalTensor<int32_t>& statusLocal, TempBufferCursor cursor, int32_t refreshValue, uint64_t totalNum){
         LocalTensor<int32_t> value = cursor.Alloc<int32_t>(CeilAlign(static_cast<int32_t>(totalNum), SORT_ELEMENTS_PER_REPEAT));
         LocalTensor<int32_t> key = cursor.Alloc<int32_t>(CeilAlign(static_cast<int32_t>(totalNum), SORT_ELEMENTS_PER_REPEAT));
@@ -728,9 +551,11 @@ private:
     __aicore__ inline void UpdateHashStatus(LocalTensor<int32_t>& topkId, LocalTensor<int32_t>& emptyIdx, LocalTensor<int32_t>& statusLocal, TempBufferCursor cursor, uint64_t uniqueNum, uint64_t totalNum){
         // 计算hash
         LocalTensor<int32_t> hashLocal = cursor.Alloc<int32_t>(totalNum);
-        HashMaskType maskType{false, true};  // empty-slot mode
         LocalTensor<uint8_t> emptyMask = cursor.Alloc<uint8_t>(totalNum);
-        ProbeHashTable(hashLocal, emptyMask, topkId, statusLocal, cursor.Fork(), totalNum, maskType); //找要更新的hashId(uniqueNum)中找到可注入的pos
+        // Only compacted misses participate in insertion. The consumer reads
+        // exactly uniqueNum predicates, so rounding the last register is safe.
+        const int32_t probeCount = CeilAlign(static_cast<int32_t>(uniqueNum), static_cast<int32_t>(AVSG_RECORD_LANES));
+        ProbeHashTable<AvsgProbeMode::Empty>(hashLocal, emptyMask, topkId, statusLocal, cursor.Fork(), probeCount);
 
         // 构建InterLevel
         uint64_t insertNum = 0;
@@ -876,10 +701,10 @@ private:
 
         // Export physical token indices using block sizes supplied by host tiling.
         LocalTensor<int32_t> topkIdToIdxMap = cursor.Alloc<int32_t>(offsetOutputUb_ / sizeof(int32_t));
-        AscendC::Duplicate(topkIdToIdxMap, INVALID_SLOT, offsetOutputUb_ / sizeof(int32_t));
         PipeBarrier<PIPE_V>();
-
-        InterleaveTensors(topkIdToIdxMap, missTopkId, emptyIdxLocal, cursor.Fork(), mismatchNum, totalNum);
+        WriteAvsgPlanPairs((__ubuf__ int32_t*)topkIdToIdxMap.GetPhyAddr(), (__ubuf__ int32_t*)missTopkId.GetPhyAddr(),
+                           (__ubuf__ int32_t*)emptyIdxLocal.GetPhyAddr(), static_cast<uint32_t>(mismatchNum),
+                           static_cast<uint16_t>(totalNum / AVSG_RECORD_LANES));
 
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         CopyOutStageOneCopyMapping(bshIdx, topkIdToIdxMap);
@@ -933,11 +758,10 @@ private:
 
             DecrementRecordCounters(statusLocal, tiling_->statesize);
 
-            // A multi-query request must reserve hits in every row before the
-            // first eviction. A single row can refresh its hits during lookup.
-            const bool singleRow = curFullQSeqLen == 1;
-            if (!singleRow) {
-                RefreshMatchStatus(statusLocal, cursor.Fork(), tOffset, curFullQSeqLen);
+            // Reserve later rows first. Row zero reserves its own hits while looking
+            // up output slots, before any eviction. Reservation changes only lifetimes.
+            if (curFullQSeqLen > 1) {
+                RefreshMatchStatus(statusLocal, cursor.Fork(), tOffset + 1, curFullQSeqLen - 1);
             }
 
             // block table 按 batch 索引，对本 batch 所有 seq/head 相同，循环外加载一次即可
@@ -954,7 +778,7 @@ private:
 
                     uint64_t mismatchNum = 0;
                     LocalTensor<uint8_t> mismatchMask = seqCursor.Alloc<uint8_t>(tiling_->topk);
-                    ProcessMissMaskAndUpdateMatchTopkId(mismatchMask, selTopKIdLocal, statusLocal, seqCursor.Fork(), mismatchNum, reusedNum, tiling_->topk, singleRow);
+                    ProcessMissMaskAndUpdateMatchTopkId(mismatchMask, selTopKIdLocal, statusLocal, seqCursor.Fork(), mismatchNum, reusedNum, tiling_->topk, seqIdx == 0);
 
                     if (mismatchNum > 0) {
                         LocalTensor<int32_t> emptyIdxLocal = seqCursor.Current();
@@ -1051,10 +875,7 @@ private:
     int32_t poolSize_ = tiling_->selMaxBlockNum * tiling_->selKvBlockSize;
 
     constexpr static int64_t HASH_ENTRY_FIELDS = 2;
-    constexpr static int64_t MAX_PROBE_RETRIES = 3;
     constexpr static int64_t MAX_RECORD_LIFETIME = 8; // (0~127)
-    constexpr static int32_t HASH_PRIME_MULTIPLIER = 2039;   // 素数，用于扰乱 topkId → hashId 映射
-    constexpr static int32_t HASH_STRIDE_MULTIPLIER = 7;      // Hash stride multiplier before masking and low-bit clearing.
     constexpr static int32_t HASH_INDEX_MASK = 0x00FFFFFF;
     constexpr static int32_t HASH_INDEX_SIGN_BIT = 0x00800000;
 
