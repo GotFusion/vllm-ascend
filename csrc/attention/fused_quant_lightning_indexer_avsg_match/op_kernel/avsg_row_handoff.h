@@ -17,9 +17,11 @@ struct LocalTopkRow {
     __aicore__ inline void Init(AscendC::TPipe& pipe, uint32_t topk, uint32_t ubBytes)
     {
         const uint32_t rowBytes = topk * sizeof(int32_t);
+        // Cube Fixpipe writes its matmul result to the first UB allocation.
+        // The Vector scratch must start at the same address on the owner AIV.
+        pipe.InitBufPool(scratch, ubBytes - rowBytes - UB_ALIGNMENT);
         pipe.InitBuffer(storage, rowBytes);
         tokens = storage.Get<int32_t>();
-        pipe.InitBufPool(scratch, ubBytes - rowBytes - UB_ALIGNMENT);
     }
 };
 
