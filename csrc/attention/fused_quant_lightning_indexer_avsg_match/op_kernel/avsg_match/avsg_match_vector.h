@@ -12,33 +12,66 @@ constexpr uint32_t AVSG_RECORD_LANES = 64;
 constexpr uint32_t AVSG_WORDS_PER_RECORD = 2;
 constexpr int32_t AVSG_TOKEN_MASK = 0x00ffffff;
 
-// Each register pair spans 64 complete {packed token, hash entry} records.
-// Both supported capacities are exact multiples of the vector width.
-__simd_vf__ inline void DecayAvsgRecords(__ubuf__ int32_t *table, uint16_t repeats)
+enum class AvsgRecordScan { Decay, Unused, Expired, DecayAndSelectExpired };
+
+// Each vector load reads 64 complete {packed token, bucket} records. Squeeze
+// appends ascending slot IDs and counts their bytes in the AR register.
+template <AvsgRecordScan mode>
+__simd_vf__ inline void ScanAvsgRecords(__ubuf__ int32_t *table, __ubuf__ int32_t *out, uint16_t repeats)
 {
     using namespace AscendC;
+    constexpr bool age = mode == AvsgRecordScan::Decay || mode == AvsgRecordScan::DecayAndSelectExpired;
+    constexpr bool collect = mode != AvsgRecordScan::Decay;
     Reg::MaskReg all = Reg::CreateMask<int32_t, Reg::MaskPattern::ALL>();
-    Reg::RegTensor<int32_t> tokenMask, minAge, minPackedAge;
-    Reg::Duplicate(tokenMask, AVSG_TOKEN_MASK);
-    Reg::Duplicate(minAge, -2);
-    Reg::Duplicate(minPackedAge, -2 * (1 << 24));
-
+    Reg::RegTensor<int32_t> tokenMask, minAge, minPackedAge, zero;
+    Reg::UnalignRegForStore store;
+    if constexpr (age || mode == AvsgRecordScan::Unused) {
+        Reg::Duplicate(tokenMask, AVSG_TOKEN_MASK);
+    }
+    if constexpr (age) {
+        Reg::Duplicate(minAge, -2);
+        Reg::Duplicate(minPackedAge, -2 * (1 << 24));
+    }
+    if constexpr (collect) {
+        Reg::ClearSpr<SpecialPurposeReg::AR>();
+        Reg::Duplicate(zero, 0);
+    }
     for (uint16_t i = 0; i < repeats; ++i) {
-        __ubuf__ int32_t *record = table + i * AVSG_RECORD_LANES * AVSG_WORDS_PER_RECORD;
-        Reg::RegTensor<int32_t> packed, bucket, age, minBucket;
+        const int32_t offset = i * AVSG_RECORD_LANES;
+        __ubuf__ int32_t *record = table + offset * AVSG_WORDS_PER_RECORD;
+        Reg::RegTensor<int32_t> packed, bucket;
         Reg::LoadAlign<int32_t, Reg::LoadDist::DIST_DINTLV_B32>(packed, bucket, record);
-        Reg::ShiftRights(age, packed, static_cast<int16_t>(24), all);
-        Reg::Adds(age, age, -1, all);
-        Reg::Max(age, age, minAge, all);
-        Reg::ShiftLefts(age, age, static_cast<int16_t>(24), all);
-        Reg::And(packed, packed, tokenMask, all);
-        Reg::Or(packed, packed, age, all);
-        // The recipes implementation also clamps the non-decremented high
-        // byte of word 1. Preserve the low 24 bits for every input bit pattern.
-        Reg::And(minBucket, bucket, tokenMask, all);
-        Reg::Or(minBucket, minBucket, minPackedAge, all);
-        Reg::Max(bucket, bucket, minBucket, all);
-        Reg::StoreAlign<int32_t, Reg::StoreDist::DIST_INTLV_B32>(record, packed, bucket, all);
+        if constexpr (age) {
+            Reg::RegTensor<int32_t> lifetime, minBucket;
+            Reg::ShiftRights(lifetime, packed, static_cast<int16_t>(24), all);
+            Reg::Adds(lifetime, lifetime, -1, all);
+            Reg::Max(lifetime, lifetime, minAge, all);
+            Reg::ShiftLefts(lifetime, lifetime, static_cast<int16_t>(24), all);
+            Reg::And(packed, packed, tokenMask, all);
+            Reg::Or(packed, packed, lifetime, all);
+            // Decay also clamps the signed high byte of word 1.
+            Reg::And(minBucket, bucket, tokenMask, all);
+            Reg::Or(minBucket, minBucket, minPackedAge, all);
+            Reg::Max(bucket, bucket, minBucket, all);
+            Reg::StoreAlign<int32_t, Reg::StoreDist::DIST_INTLV_B32>(record, packed, bucket, all);
+        }
+        if constexpr (collect) {
+            Reg::MaskReg take;
+            if constexpr (mode == AvsgRecordScan::Unused) {
+                Reg::RegTensor<int32_t> token;
+                Reg::And(token, packed, tokenMask, all);
+                Reg::Compare<int32_t, CMPMODE::EQ>(take, token, tokenMask, all);
+            } else {
+                Reg::Compare<int32_t, CMPMODE::LT>(take, packed, zero, all);
+            }
+            Reg::RegTensor<int32_t> indices, selected;
+            Reg::Arange(indices, offset);
+            Reg::Squeeze<int32_t, Reg::GatherMaskMode::STORE_REG>(selected, indices, take);
+            Reg::StoreUnAlign<int32_t, Reg::PostLiteral::POST_MODE_UPDATE>(out, selected, store);
+        }
+    }
+    if constexpr (collect) {
+        Reg::StoreUnAlignPost(out, store);
     }
 }
 
@@ -70,10 +103,10 @@ constexpr uint32_t AVSG_HASH_MULTIPLIER = 2039;
 constexpr uint32_t AVSG_HASH_STRIDE_MULTIPLIER = 7;
 constexpr uint16_t AVSG_HASH_PROBES = 4;
 
-// Compute four bounded double-hash probes per token. Only read the table here:
-// insertion still scatters all winners together after selecting their buckets.
+// Match returns the resident slot read for the final probe. Empty returns
+// the bucket where insertion will scatter. Neither mode mutates the table.
 template <AvsgProbeMode mode>
-__simd_vf__ inline void ProbeAvsgBuckets(__ubuf__ uint32_t *buckets, __ubuf__ uint32_t *flags,
+__simd_vf__ inline void ProbeAvsgTable(__ubuf__ uint32_t *indices, __ubuf__ uint32_t *flags,
                                          __ubuf__ uint32_t *tokens, __ubuf__ uint32_t *table,
                                          uint16_t repeats, uint32_t capacity)
 {
@@ -90,7 +123,7 @@ __simd_vf__ inline void ProbeAvsgBuckets(__ubuf__ uint32_t *buckets, __ubuf__ ui
         Reg::Duplicate(fingerprintMask, static_cast<uint32_t>(AVSG_TOKEN_MASK) & ~(capacity - 1));
     }
     for (uint16_t i = 0; i < repeats; ++i) {
-        Reg::RegTensor<uint32_t> token, bucket, stride;
+        Reg::RegTensor<uint32_t> token, bucket, stride, slot;
         Reg::LoadAlign<uint32_t, Reg::LoadDist::DIST_NORM>(token, tokens + i * AVSG_RECORD_LANES);
         Reg::Muls(bucket, token, AVSG_HASH_MULTIPLIER, all);
         Reg::And(bucket, bucket, slotMask, all);
@@ -103,8 +136,8 @@ __simd_vf__ inline void ProbeAvsgBuckets(__ubuf__ uint32_t *buckets, __ubuf__ ui
             Reg::ShiftLefts(offset, bucket, static_cast<int16_t>(1), all);
             Reg::Adds(offset, offset, 1u, all);
             Reg::Gather(entry, table, offset, all);
-            Reg::And(offset, entry, slotMask, all);
-            Reg::ShiftLefts(offset, offset, static_cast<int16_t>(1), all);
+            Reg::And(slot, entry, slotMask, all);
+            Reg::ShiftLefts(offset, slot, static_cast<int16_t>(1), all);
             Reg::Gather(packed, table, offset, all);
             if constexpr (mode == AvsgProbeMode::Match) {
                 // Decode the reserved token to UINT32_MAX before comparing.
@@ -132,7 +165,11 @@ __simd_vf__ inline void ProbeAvsgBuckets(__ubuf__ uint32_t *buckets, __ubuf__ ui
         }
         Reg::RegTensor<uint32_t> valid;
         Reg::Select(valid, one, zero, found);
-        Reg::StoreAlign<uint32_t, Reg::StoreDist::DIST_NORM>(buckets + i * AVSG_RECORD_LANES, bucket, all);
+        if constexpr (mode == AvsgProbeMode::Match) {
+            Reg::StoreAlign<uint32_t, Reg::StoreDist::DIST_NORM>(indices + i * AVSG_RECORD_LANES, slot, all);
+        } else {
+            Reg::StoreAlign<uint32_t, Reg::StoreDist::DIST_NORM>(indices + i * AVSG_RECORD_LANES, bucket, all);
+        }
         Reg::StoreAlign<uint32_t, Reg::StoreDist::DIST_NORM>(flags + i * AVSG_RECORD_LANES, valid, all);
     }
 }
